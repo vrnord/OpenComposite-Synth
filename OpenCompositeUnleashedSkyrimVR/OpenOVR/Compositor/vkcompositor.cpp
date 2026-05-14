@@ -1,8 +1,12 @@
 #include "generated/interfaces/vrtypes.h"
 #include "stdafx.h"
-#include <vulkan/vulkan_core.h>
 
 #if defined(SUPPORT_VK)
+// VRNord/CS-Fork: moved inside the SUPPORT_VK guard so the file compiles
+// when Vulkan support is disabled (e.g. our SkyrimVR-only build with no
+// bundled Vulkan SDK headers). Upstream had this include outside the
+// guard which made the file uncompilable without vulkan.h available.
+#include <vulkan/vulkan_core.h>
 
 // Required for the close(2) call for the texture shared memory on Linux
 #ifndef _WIN32

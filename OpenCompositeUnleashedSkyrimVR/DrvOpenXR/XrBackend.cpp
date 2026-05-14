@@ -154,6 +154,7 @@ void XrBackend::GetDeviceToAbsoluteTrackingPose(
 	}
 }
 
+#ifdef SUPPORT_VK
 static void find_queue_family_and_queue_idx(VkDevice dev, VkPhysicalDevice pdev, VkQueue desired_queue, uint32_t& out_queueFamilyIndex, uint32_t& out_queueIndex)
 {
 	uint32_t queue_family_count;
@@ -179,6 +180,7 @@ static void find_queue_family_and_queue_idx(VkDevice dev, VkPhysicalDevice pdev,
 	OOVR_ABORT("Couldn't find the queue family index/queue index of the queue that the OpenVR app gave us!"
 	           "This is really odd and really shouldn't ever happen");
 }
+#endif // SUPPORT_VK
 
 /* Submitting Frames */
 void XrBackend::CheckOrInitCompositors(const vr::Texture_t* tex)
@@ -248,6 +250,7 @@ void XrBackend::CheckOrInitCompositors(const vr::Texture_t* tex)
 			break;
 		}
 		case vr::TextureType_Vulkan: {
+#ifdef SUPPORT_VK
 			const vr::VRVulkanTextureData_t* vktex = (vr::VRVulkanTextureData_t*)tex->handle;
 
 			VkPhysicalDevice xr_desire;
@@ -277,6 +280,11 @@ void XrBackend::CheckOrInitCompositors(const vr::Texture_t* tex)
 
 			graphicsBinding = std::make_unique<BindingWrapper<XrGraphicsBindingVulkanKHR>>(binding);
 			DrvOpenXR::SetupSession();
+#else
+			// VRNord/CS-Fork build has SUPPORT_VK disabled — no Vulkan SDK shipped.
+			// Match the D3D12 branch's pattern above for missing-API support.
+			OOVR_ABORT("Application is trying to submit a Vulkan texture, which OpenComposite supports but is disabled in this build");
+#endif
 			break;
 		}
 		case vr::TextureType_OpenGL: {

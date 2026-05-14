@@ -23,8 +23,17 @@ set(GENERATED_DIR ${CMAKE_BINARY_DIR}/generated)
 
 # Platform-dependent flags
 # Support Vulkan on Linux instead of DirectX
+#
+# VRNord/CS-Fork build: -DSUPPORT_VK dropped on Windows. SkyrimVR is
+# DirectX 11-only; Vulkan code paths never execute in our deployment and
+# the bundled Vulkan SDK headers aren't shipped in this fork (libs/vulkan/
+# is absent). Dropping the flag avoids pulling vulkan/vulkan.h. Paired
+# with a one-line gate in OpenOVR/Compositor/vkcompositor.cpp:3 where a
+# top-level Vulkan include exists outside the SUPPORT_VK guard.
+# Restore the flag if a future Vulkan game targets this fork; in that
+# case also ship libs/vulkan/Include and libs/vulkan/Lib.
 if (WIN32)
-	set(GRAPHICS_API_SUPPORT_FLAGS -DSUPPORT_DX -DSUPPORT_DX11 -DSUPPORT_DX12 -DSUPPORT_VK -DSUPPORT_GL)
+	set(GRAPHICS_API_SUPPORT_FLAGS -DSUPPORT_DX -DSUPPORT_DX11 -DSUPPORT_DX12 -DSUPPORT_GL)
 elseif (ANDROID)
 	set(GRAPHICS_API_SUPPORT_FLAGS -DSUPPORT_VK -DSUPPORT_GLES)
 else ()
@@ -71,15 +80,23 @@ target_include_directories(OpenVR INTERFACE OpenVRHeaders) # TODO make this priv
 add_library(Vulkan INTERFACE)
 
 if (WIN32)
-	# On Windows, use the bundled copy
-	target_include_directories(Vulkan INTERFACE libs/vulkan/Include) # TODO make this private and put the public headers elsewhere
-	if ("${CMAKE_SIZEOF_VOID_P}" EQUAL "8")
-		target_link_libraries(Vulkan INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/libs/vulkan/Lib/vulkan-1.lib)
-	else ()
-		target_link_libraries(Vulkan INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/libs/vulkan/Lib32/vulkan-1.lib)
-	endif ()
-
-	target_compile_definitions(Vulkan INTERFACE -DVK_USE_PLATFORM_WIN32_KHR)
+	# VRNord/CS-Fork: -DSUPPORT_VK dropped on Windows (see top of file).
+	# Skip the bundled-library include + link entirely; they reference
+	# libs/vulkan/Include and libs/vulkan/Lib which aren't shipped in this
+	# fork. The Vulkan INTERFACE target stays as an empty placeholder so
+	# downstream `target_link_libraries(... Vulkan)` calls still resolve.
+	# To re-enable Vulkan support, restore the original block below and
+	# re-add -DSUPPORT_VK to GRAPHICS_API_SUPPORT_FLAGS at the top of file.
+	#
+	# Original Windows branch (kept for reference, restore as-is when
+	# Vulkan support is wanted):
+	# target_include_directories(Vulkan INTERFACE libs/vulkan/Include)
+	# if ("${CMAKE_SIZEOF_VOID_P}" EQUAL "8")
+	# 	target_link_libraries(Vulkan INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/libs/vulkan/Lib/vulkan-1.lib)
+	# else ()
+	# 	target_link_libraries(Vulkan INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/libs/vulkan/Lib32/vulkan-1.lib)
+	# endif ()
+	# target_compile_definitions(Vulkan INTERFACE -DVK_USE_PLATFORM_WIN32_KHR)
 elseif (ANDROID)
 	# Let the system sort out the linkage, we'll just use our included headers
 	target_include_directories(Vulkan INTERFACE libs/vulkan/Include)
@@ -278,6 +295,7 @@ add_library(OCCore STATIC
 	OpenOVR/Reimpl/BaseChaperoneSetup.cpp
 	OpenOVR/Reimpl/BaseClientCore.cpp
 	OpenOVR/Reimpl/BaseCompositor.cpp
+	OpenOVR/Reimpl/BaseCompositorExt.cpp
 	OpenOVR/Reimpl/BaseExtendedDisplay.cpp
 	OpenOVR/Reimpl/BaseInput.cpp
 	OpenOVR/Reimpl/BaseInput_Hand.cpp
@@ -295,6 +313,7 @@ add_library(OCCore STATIC
 	OpenOVR/Reimpl/CVRChaperoneSetup.cpp
 	OpenOVR/Reimpl/CVRClientCore.cpp
 	OpenOVR/Reimpl/CVRCompositor.cpp
+	OpenOVR/Reimpl/CVRCompositorExt.cpp
 	OpenOVR/Reimpl/CVRExtendedDisplay.cpp
 	OpenOVR/Reimpl/CVRInput.cpp
 	OpenOVR/Reimpl/CVRInputInternal.cpp
@@ -343,6 +362,7 @@ add_library(OCCore STATIC
 	OpenOVR/Reimpl/BaseChaperoneSetup.h
 	OpenOVR/Reimpl/BaseClientCore.h
 	OpenOVR/Reimpl/BaseCompositor.h
+	OpenOVR/Reimpl/BaseCompositorExt.h
 	OpenOVR/Reimpl/BaseExtendedDisplay.h
 	OpenOVR/Reimpl/BaseInput.h
 	OpenOVR/Reimpl/BaseInputInternal.cpp
@@ -371,6 +391,7 @@ add_library(OCCore STATIC
 	OpenVRHeaders/custom_interfaces/IVRClientCore_002.h
 	OpenVRHeaders/custom_interfaces/IVRClientCore_003.h
 	OpenVRHeaders/custom_interfaces/IVRCompositor_017.h
+	OpenVRHeaders/custom_interfaces/IVRCompositorExt_001.h
 	OpenVRHeaders/custom_interfaces/IVRMailbox_001.h
 	OpenVRHeaders/custom_interfaces/IVRInputInternal_002.h
 	OpenVRHeaders/custom_interfaces/IVRControlPanel_006.h

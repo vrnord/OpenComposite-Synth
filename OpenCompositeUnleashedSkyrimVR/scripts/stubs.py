@@ -51,6 +51,7 @@ output_dir.mkdir(parents=True, exist_ok=True)
 # with the build process.
 interfaces_list = [
     "Compositor",
+    "CompositorExt",  # NEW: VRNord synth submission extension (IVRCompositorExt_001, CUSTOM)
     "System",
     "Chaperone",
     "Overlay",
