@@ -4,14 +4,13 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
-#include <cstdlib>
-#include <cstring>
 #include <deque>
 #include <mutex>
 #include <thread>
 
-// OpenComposite globals: xr_session, OpenXR primitives.
+// OpenComposite globals: xr_session, OpenXR primitives, oovr_global_configuration.
 // OpenOVR/ is on the include path (see other Reimpl/*.cpp).
+#include "Misc/Config.h"
 #include "Misc/xrutil.h"
 
 namespace {
@@ -177,25 +176,6 @@ void SynthThreadFunc() {
 		(unsigned long long)g_synthEndErrors.load());
 }
 
-bool ReadFallbackEnvVar() {
-	char buf[16] = {};
-	size_t len = 0;
-#ifdef _WIN32
-	errno_t err = getenv_s(&len, buf, sizeof(buf),
-		"OPENCOMPOSITE_SYNTH_FALLBACK_SINGLETHREAD");
-	(void)err;
-#else
-	const char* v = std::getenv("OPENCOMPOSITE_SYNTH_FALLBACK_SINGLETHREAD");
-	if (v) {
-		std::strncpy(buf, v, sizeof(buf) - 1);
-		len = std::strlen(buf) + 1;
-	}
-#endif
-	if (len == 0) return false;
-	return (buf[0] == '1' || buf[0] == 't' || buf[0] == 'T'
-	     || buf[0] == 'y' || buf[0] == 'Y');
-}
-
 } // anonymous namespace
 
 // === Static lifecycle methods ===
@@ -206,7 +186,10 @@ void BaseCompositorExt::StartSynthThread() {
 		return;
 	}
 
-	g_fallbackSingleThread = ReadFallbackEnvVar();
+	// Read the fallback toggle from opencomposite.ini at thread start time.
+	// Setting key: synthFallbackSingleThread (under default section).
+	// See opencomposite.ini.example for documentation.
+	g_fallbackSingleThread = oovr_global_configuration.SynthFallbackSingleThread();
 	OOVR_LOGF("[SynthThread] StartSynthThread: fallback_singlethread=%d",
 		(int)g_fallbackSingleThread);
 

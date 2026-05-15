@@ -19,7 +19,7 @@ public:
 	// Called once per SubmitInterpolatedFrame from CS-Fork's hook. In the
 	// default (multi-threaded) path, builds a SynthRequest and enqueues it
 	// on the synth thread's work queue. In the fallback (single-threaded)
-	// path — selected by env var OPENCOMPOSITE_SYNTH_FALLBACK_SINGLETHREAD=1
+	// path — selected by opencomposite.ini setting `synthFallbackSingleThread=true`
 	// at thread start time — runs the OpenXR frame cycle synchronously on
 	// the calling (engine) thread.
 	vr::IVRCompositorExt_001::EVRCompositorError SubmitInterpolatedFrame(

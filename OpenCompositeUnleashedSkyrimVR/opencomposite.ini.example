@@ -295,3 +295,24 @@
 ;   For long_press: how long you must hold the button
 ; Default: 500
 ;shortcutTiming=500
+
+
+; ----------------------------------------------------------------------------
+;  SYNTH FRAME SUBMISSION  (VRNord/CS-Fork extension — IVRCompositorExt_001)
+; ----------------------------------------------------------------------------
+;
+;  These settings affect CS-Fork's synth-frame interleave feature, which
+;  submits a synthetic interpolated frame at half-vsync offsets relative to
+;  the engine's real frames. Only meaningful when a client (CS-Fork) is
+;  calling IVRCompositorExt_001::SubmitInterpolatedFrame; otherwise inert.
+
+; When true, the per-submission OpenXR frame cycle (xrWaitFrame/Begin/End)
+; runs synchronously on the engine thread instead of on a dedicated worker
+; thread. Diagnostic toggle — used to isolate whether multi-threaded OpenXR
+; frame submission is the source of any submission failures observed.
+;
+; The worker-thread path (false) is the production architecture. Setting
+; this true makes synth submission completely synchronous, which is slower
+; but simpler to reason about when debugging.
+; Default: false
+;synthFallbackSingleThread=false

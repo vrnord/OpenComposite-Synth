@@ -873,8 +873,9 @@ void XrBackend::OnSessionCreated()
 	}
 
 	// Start synth submission worker thread (VRNord/CS-Fork extension).
-	// Reads env var OPENCOMPOSITE_SYNTH_FALLBACK_SINGLETHREAD at this point
-	// to decide between worker-thread mode and synchronous-on-caller mode.
+	// Reads opencomposite.ini setting `synthFallbackSingleThread` at this
+	// point to decide between worker-thread mode (default) and synchronous-
+	// on-caller mode (diagnostic).
 	BaseCompositorExt::StartSynthThread();
 }
 

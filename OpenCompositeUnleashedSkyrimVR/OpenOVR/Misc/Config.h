@@ -23,6 +23,11 @@ public:
 	inline bool InitUsingVulkan() const { return initUsingVulkan; }
 	float HiddenMeshVerticalScale() const { return hiddenMeshVerticalScale; }
 	inline bool LogAllOpenVRCalls() const { return logAllOpenVRCalls; }
+	// VRNord/CS-Fork synth submission extension (IVRCompositorExt_001):
+	// when true, the per-submission OpenXR frame cycle runs synchronously
+	// on the calling thread instead of on a dedicated worker thread.
+	// Diagnostic toggle. Default false.
+	inline bool SynthFallbackSingleThread() const { return synthFallbackSingleThread; }
 	inline bool EnableAudioSwitch() const { return enableAudioSwitch; }
 	std::string AudioDeviceName() const { return audioDeviceName; }
 	inline bool EnableInputSmoothing() { return enableInputSmoothing; }
@@ -108,6 +113,8 @@ private:
 	bool initUsingVulkan = false;
 	float hiddenMeshVerticalScale = 1.0f;
 	bool logAllOpenVRCalls = false;
+	// VRNord/CS-Fork synth submission extension — see public getter for docs.
+	bool synthFallbackSingleThread = false;
 	bool enableAudioSwitch = false;
 	std::string audioDeviceName = "";
 	bool enableInputSmoothing = false;
