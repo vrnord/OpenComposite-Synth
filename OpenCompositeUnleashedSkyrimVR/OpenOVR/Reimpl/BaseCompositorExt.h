@@ -16,16 +16,12 @@ public:
 	BaseCompositorExt() = default;
 	~BaseCompositorExt() = default;
 
-	// See IVRCompositorExt_001.h for parameter contract. This stub validates
-	// inputs, logs, and returns success. Future commits will route the
-	// submission through a dedicated synth thread to OpenXR xrEndFrame with
-	// explicit displayTime.
-	//
-	// Return type is the interface-version-scoped enum (matches the
-	// codegen-generated proxy class's signature). The codegen also generates
-	// a cast at the proxy call site for vr::namespace types, so this
-	// strictly only needs to be implicit-convertible — but using the exact
-	// type keeps the API clean.
+	// Called once per SubmitInterpolatedFrame from CS-Fork's hook. In the
+	// default (multi-threaded) path, builds a SynthRequest and enqueues it
+	// on the synth thread's work queue. In the fallback (single-threaded)
+	// path — selected by env var OPENCOMPOSITE_SYNTH_FALLBACK_SINGLETHREAD=1
+	// at thread start time — runs the OpenXR frame cycle synchronously on
+	// the calling (engine) thread.
 	vr::IVRCompositorExt_001::EVRCompositorError SubmitInterpolatedFrame(
 		const vr::Texture_t * synthTexture,
 		const vr::VRTextureBounds_t * boundsLeft,
@@ -34,8 +30,16 @@ public:
 		double displayTimeOffsetSeconds
 	);
 
+	// Lifecycle hooks called from XrBackend::OnSessionCreated and
+	// PrepareForSessionShutdown. Idempotent — safe to call repeatedly.
+	// Static because the thread state is per-process, not per-instance
+	// (OpenXR has one session per process).
+	static void StartSynthThread();
+	static void StopSynthThread();
+
 private:
 	// Call counter so we can verify the call site is being hit without
-	// spamming once-per-frame log lines.
+	// spamming once-per-frame log lines. Also used as the SynthRequest
+	// sequence number.
 	uint64_t callCount = 0;
 };

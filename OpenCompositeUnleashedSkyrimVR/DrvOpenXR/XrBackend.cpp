@@ -22,6 +22,7 @@
 #endif
 
 // FIXME find a better way to send the OnPostFrame call?
+#include "../OpenOVR/Reimpl/BaseCompositorExt.h"
 #include "../OpenOVR/Reimpl/BaseInput.h"
 #include "../OpenOVR/Reimpl/BaseOverlay.h"
 #include "../OpenOVR/Reimpl/BaseSystem.h"
@@ -870,10 +871,19 @@ void XrBackend::OnSessionCreated()
 
 		PumpEvents();
 	}
+
+	// Start synth submission worker thread (VRNord/CS-Fork extension).
+	// Reads env var OPENCOMPOSITE_SYNTH_FALLBACK_SINGLETHREAD at this point
+	// to decide between worker-thread mode and synchronous-on-caller mode.
+	BaseCompositorExt::StartSynthThread();
 }
 
 void XrBackend::PrepareForSessionShutdown()
 {
+	// Stop synth submission worker thread first, before tearing down any
+	// session resources it may be using (VRNord/CS-Fork extension).
+	BaseCompositorExt::StopSynthThread();
+
 	for (std::unique_ptr<Compositor>& c : compositors) {
 		c.reset();
 	}
