@@ -41,6 +41,8 @@ std::atomic<uint64_t>       g_synthWaitErrors{ 0 };
 std::atomic<uint64_t>       g_synthBeginErrors{ 0 };
 std::atomic<uint64_t>       g_synthEndErrors{ 0 };
 std::atomic<uint64_t>       g_synthSkippedPastTime{ 0 };
+std::atomic<uint64_t>       g_synthSkippedNoAnchor{ 0 };
+std::atomic<uint64_t>       g_synthCallOrderInvalid{ 0 };
 
 // Engine's most recent xrEndFrame displayTime, in nanoseconds (XrTime).
 // Updated by XrBackend::SubmitFrames via RecordEngineFrameSubmit. Read by
@@ -74,19 +76,21 @@ bool ShouldLogRate(uint64_t count) {
 	return (count <= 10) || (count % 300 == 0);
 }
 
-// Execute one synth frame cycle: xrWaitFrame → xrBeginFrame → xrEndFrame
-// with layerCount=0. Called from either the synth thread (default) or
-// the engine thread (fallback). Returns true if the cycle completed
-// without aborting; failure modes are individually logged.
+// Execute one synth frame cycle: xrBeginFrame -> xrEndFrame with
+// layerCount=0. Called from either the synth thread (default) or the
+// engine thread (fallback). Returns true if the cycle completed without
+// aborting; failure modes are individually logged.
 //
 // Phase C2.5: displayTime is anchored to engine's most recent submitted
 // frame (recorded via RecordEngineFrameSubmit) plus half a frame interval,
-// so the synth frame lands BETWEEN engine's frames. If the target is in
-// the past relative to xrWaitFrame's predictedDisplayTime, we skip the
-// submission and count it.
+// so the synth frame lands BETWEEN engine's frames.
+//
+// Phase C2.6 (current): no xrWaitFrame on this thread — engine owns the
+// per-session frame-pacing gate exclusively. If runtime rejects with
+// XR_ERROR_CALL_ORDER_INVALID, we count it and learn the runtime is
+// strict; otherwise we proceed.
 bool RunSynthFrameCycle(const SynthRequest& req) {
-	// Acquire shared lock on the OpenXR session (matches the pattern at
-	// XrBackend.cpp — auto lock = xr_session.lock_shared()).
+	// Acquire shared lock on the OpenXR session.
 	auto lock = xr_session.lock_shared();
 	XrSession session = xr_session.get();
 	if (session == XR_NULL_HANDLE) {
@@ -95,27 +99,20 @@ bool RunSynthFrameCycle(const SynthRequest& req) {
 		return false;
 	}
 
-	const bool shouldLogThis = ShouldLogRate(req.sequence);
+	// === No xrWaitFrame in synth thread (C2.6 experiment) ===
+	// Hypothesis: xrWaitFrame on the synth thread contends with engine's
+	// xrWaitFrame for the per-session frame-pacing gate. Engine's frame
+	// loop slows to ~64% speed when synth is running. By skipping the
+	// wait call entirely we let engine own the gate exclusively.
+	//
+	// Per OpenXR spec, xrBeginFrame "must follow" xrWaitFrame. SteamVR-
+	// OpenXR may enforce this strictly (returning XR_ERROR_CALL_ORDER_
+	// INVALID = -37) or may be lenient. Either outcome is diagnostic.
 
-	// === xrWaitFrame ===
-	// Required by spec before xrBeginFrame. We use its predictedDisplayTime
-	// only as a sanity reference for the past-time gate; the actual target
-	// displayTime comes from engine's most recent xrEndFrame (recorded via
-	// RecordEngineFrameSubmit).
-	XrFrameWaitInfo waitInfo{ XR_TYPE_FRAME_WAIT_INFO };
-	XrFrameState state{ XR_TYPE_FRAME_STATE };
-	XrResult waitRes = xrWaitFrame(session, &waitInfo, &state);
-	if (XR_FAILED(waitRes)) {
-		g_synthWaitErrors.fetch_add(1);
-		OOVR_LOGF("[SynthThread] xrWaitFrame failed: result=%d seq=%llu",
-			(int)waitRes, (unsigned long long)req.sequence);
-		return false;
-	}
-
-	// === Compute target displayTime ===
-	// Anchor to engine's most recent submitted displayTime, offset forward
-	// by half the frame interval. This lands BETWEEN engine's last frame
-	// and its next predicted frame.
+	// Anchor target on engine's most recently submitted displayTime.
+	// If engine hasn't submitted yet (engineDisplay == 0), we have no
+	// anchor — skip this cycle. We could fall back to current wall-clock
+	// time, but for this experiment we want strict no-wait semantics.
 	const int64_t engineDisplay = g_engineLastDisplayTime.load();
 	int64_t intervalNs = g_engineFrameIntervalNs.load();
 	if (intervalNs <= 0) {
@@ -123,55 +120,29 @@ bool RunSynthFrameCycle(const SynthRequest& req) {
 	}
 	const int64_t halfIntervalNs = intervalNs / 2;
 
-	int64_t targetTime;
-	bool usedEngineAnchor;
-	if (engineDisplay > 0) {
-		// Production path: anchor to engine's frame + half-interval forward.
-		targetTime = engineDisplay + halfIntervalNs;
-		usedEngineAnchor = true;
-	} else {
-		// Engine hasn't submitted yet — fall back to xrWaitFrame's prediction
-		// plus the same forward offset. We intentionally do NOT use
-		// req.displayTimeOffsetSeconds here because the caller's offset
-		// assumed the old (negative) semantics.
-		targetTime = (int64_t)state.predictedDisplayTime + halfIntervalNs;
-		usedEngineAnchor = false;
-	}
+	bool shouldLogThis = ShouldLogRate(req.sequence);
 
-	// Past-time gate: if target is in the past relative to "now" (using
-	// predictedDisplayTime - intervalNs as a proxy for the current vsync),
-	// the runtime will reject it with XR_ERROR_TIME_INVALID. Skip + count.
-	constexpr int64_t pastGuardNs = 500000; // 0.5ms slack
-	const int64_t nowProxy = (int64_t)state.predictedDisplayTime - intervalNs;
-
-	if (targetTime <= nowProxy + pastGuardNs) {
-		g_synthSkippedPastTime.fetch_add(1);
+	if (engineDisplay <= 0) {
+		g_synthSkippedNoAnchor.fetch_add(1);
 		if (shouldLogThis) {
-			OOVR_LOGF("[SynthThread] cycle #%llu SKIPPED (target in past): "
-				"target=%lld nowProxy=%lld delta=%lld engineDisplay=%lld "
-				"halfIntervalNs=%lld",
-				(unsigned long long)req.sequence,
-				(long long)targetTime, (long long)nowProxy,
-				(long long)(targetTime - nowProxy),
-				(long long)engineDisplay,
-				(long long)halfIntervalNs);
+			OOVR_LOGF("[SynthThread] cycle #%llu SKIPPED (no engine anchor yet)",
+				(unsigned long long)req.sequence);
 		}
 		return false;
 	}
 
+	const int64_t targetTime = engineDisplay + halfIntervalNs;
+
 	if (shouldLogThis) {
-		OOVR_LOGF("[SynthThread] cycle #%llu: xrWaitFrame ok, "
-			"predictedDisplayTime=%lld engineDisplay=%lld "
-			"intervalNs=%lld halfIntervalNs=%lld targetTime=%lld "
-			"deltaFromEngine=%lld anchor=%s",
+		OOVR_LOGF("[SynthThread] cycle #%llu: no-wait mode, "
+			"engineDisplay=%lld intervalNs=%lld halfIntervalNs=%lld "
+			"targetTime=%lld deltaFromEngine=%lld",
 			(unsigned long long)req.sequence,
-			(long long)state.predictedDisplayTime,
 			(long long)engineDisplay,
 			(long long)intervalNs,
 			(long long)halfIntervalNs,
 			(long long)targetTime,
-			(long long)(engineDisplay > 0 ? targetTime - engineDisplay : 0),
-			usedEngineAnchor ? "ENGINE" : "PREDICTED");
+			(long long)halfIntervalNs);
 	}
 
 	// === xrBeginFrame ===
@@ -179,14 +150,25 @@ bool RunSynthFrameCycle(const SynthRequest& req) {
 	XrResult beginRes = xrBeginFrame(session, &beginInfo);
 	if (XR_FAILED(beginRes)) {
 		g_synthBeginErrors.fetch_add(1);
-		OOVR_LOGF("[SynthThread] xrBeginFrame failed: result=%d seq=%llu",
-			(int)beginRes, (unsigned long long)req.sequence);
+		if (beginRes == XR_ERROR_CALL_ORDER_INVALID) {
+			g_synthCallOrderInvalid.fetch_add(1);
+			// Loud first-time diagnostic — this answers the experiment.
+			if (g_synthCallOrderInvalid.load() <= 3) {
+				OOVR_LOGF("[SynthThread] *** xrBeginFrame returned "
+					"XR_ERROR_CALL_ORDER_INVALID (-37) seq=%llu — runtime "
+					"requires xrWaitFrame before xrBeginFrame. "
+					"C2.6 experiment FALSIFIED. Will need alternative "
+					"architecture for synth submission.",
+					(unsigned long long)req.sequence);
+			}
+		} else {
+			OOVR_LOGF("[SynthThread] xrBeginFrame failed: result=%d seq=%llu",
+				(int)beginRes, (unsigned long long)req.sequence);
+		}
 		return false;
 	}
 
 	// === xrEndFrame with layerCount=0 ===
-	// Still phase C2 in spirit — no composition content. Real synth layers
-	// land in Phase C3.
 	XrFrameEndInfo endInfo{ XR_TYPE_FRAME_END_INFO };
 	endInfo.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
 	endInfo.displayTime = (XrTime)targetTime;
@@ -200,7 +182,7 @@ bool RunSynthFrameCycle(const SynthRequest& req) {
 			(int)endRes, (unsigned long long)req.sequence,
 			(long long)targetTime,
 			(long long)engineDisplay,
-			(long long)(engineDisplay > 0 ? targetTime - engineDisplay : 0));
+			(long long)halfIntervalNs);
 		return false;
 	}
 	if (shouldLogThis) {
@@ -248,14 +230,17 @@ void SynthThreadFunc() {
 	}
 
 	OOVR_LOGF("[SynthThread] thread exiting. enq=%llu dq=%llu frames=%llu "
-		"waitErr=%llu beginErr=%llu endErr=%llu skippedPastTime=%llu",
+		"waitErr=%llu beginErr=%llu endErr=%llu "
+		"skippedPastTime=%llu skippedNoAnchor=%llu callOrderInvalid=%llu",
 		(unsigned long long)g_synthEnqueueCount.load(),
 		(unsigned long long)g_synthDequeueCount.load(),
 		(unsigned long long)g_synthFrameCount.load(),
 		(unsigned long long)g_synthWaitErrors.load(),
 		(unsigned long long)g_synthBeginErrors.load(),
 		(unsigned long long)g_synthEndErrors.load(),
-		(unsigned long long)g_synthSkippedPastTime.load());
+		(unsigned long long)g_synthSkippedPastTime.load(),
+		(unsigned long long)g_synthSkippedNoAnchor.load(),
+		(unsigned long long)g_synthCallOrderInvalid.load());
 }
 
 } // anonymous namespace
@@ -290,6 +275,8 @@ void BaseCompositorExt::StartSynthThread() {
 	g_synthBeginErrors.store(0);
 	g_synthEndErrors.store(0);
 	g_synthSkippedPastTime.store(0);
+	g_synthSkippedNoAnchor.store(0);
+	g_synthCallOrderInvalid.store(0);
 	g_engineLastDisplayTime.store(0);
 	g_enginePrevDisplayTime.store(0);
 	g_engineFrameIntervalNs.store(0);
@@ -311,7 +298,8 @@ void BaseCompositorExt::StopSynthThread() {
 
 	OOVR_LOGF("[SynthThread] StopSynthThread: stopping. "
 		"final stats: enq=%llu dq=%llu frames=%llu "
-		"waitErr=%llu beginErr=%llu endErr=%llu skippedPastTime=%llu "
+		"waitErr=%llu beginErr=%llu endErr=%llu "
+		"skippedPastTime=%llu skippedNoAnchor=%llu callOrderInvalid=%llu "
 		"observedIntervalNs=%lld",
 		(unsigned long long)g_synthEnqueueCount.load(),
 		(unsigned long long)g_synthDequeueCount.load(),
@@ -320,6 +308,8 @@ void BaseCompositorExt::StopSynthThread() {
 		(unsigned long long)g_synthBeginErrors.load(),
 		(unsigned long long)g_synthEndErrors.load(),
 		(unsigned long long)g_synthSkippedPastTime.load(),
+		(unsigned long long)g_synthSkippedNoAnchor.load(),
+		(unsigned long long)g_synthCallOrderInvalid.load(),
 		(long long)g_engineFrameIntervalNs.load());
 
 	if (!g_fallbackSingleThread) {
