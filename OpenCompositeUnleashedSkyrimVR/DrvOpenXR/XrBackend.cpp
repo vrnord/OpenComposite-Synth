@@ -551,6 +551,11 @@ void XrBackend::SubmitFrames(bool showSkybox, bool postPresent)
 
 	OOVR_FAILED_XR_SOFT_ABORT(xrEndFrame(xr_session.get(), &info));
 
+	// Record engine's submitted displayTime for the synth thread to anchor
+	// against. The synth thread will target a time half a frame interval
+	// forward from this. (VRNord synth extension — Phase C2.5.)
+	BaseCompositorExt::RecordEngineFrameSubmit((int64_t)info.displayTime);
+
 	BaseSystem* sys = GetUnsafeBaseSystem();
 	if (sys) {
 		sys->_OnPostFrame();

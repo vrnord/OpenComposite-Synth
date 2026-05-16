@@ -37,6 +37,18 @@ public:
 	static void StartSynthThread();
 	static void StopSynthThread();
 
+	// Called by XrBackend::SubmitFrames each time engine commits a frame
+	// via xrEndFrame. Records the engine's most recent displayTime so the
+	// synth thread can target its own submissions BETWEEN engine's frames.
+	// Idempotent and lock-free (single writer, single reader, atomic store).
+	static void RecordEngineFrameSubmit(int64_t engineDisplayTime);
+
+	// Set the predicted frame interval in nanoseconds. Called once when
+	// session info is available (typically auto-estimated by
+	// RecordEngineFrameSubmit after two valid samples). Synth thread uses
+	// half of this value as its offset from engineDisplayTime.
+	static void SetFrameIntervalNs(int64_t frameIntervalNs);
+
 private:
 	// Call counter so we can verify the call site is being hit without
 	// spamming once-per-frame log lines. Also used as the SynthRequest
