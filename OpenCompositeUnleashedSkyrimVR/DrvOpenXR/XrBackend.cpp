@@ -388,6 +388,21 @@ void XrBackend::WaitForTrackingData()
 		return;
 	}
 
+	// Phase C2.7a split: default no-synth flow calls both phases
+	// back-to-back, preserving identical behavior to the pre-split
+	// implementation. The synth submission flow (Phase C2.7b) will
+	// instead call WaitForTrackingData_WaitAndPoses() here, perform a
+	// synth wait/begin/end cycle, then call OpenEngineFrameCycle().
+	WaitForTrackingData_WaitAndPoses();
+	OpenEngineFrameCycle();
+}
+
+void XrBackend::WaitForTrackingData_WaitAndPoses()
+{
+	// Caller has already verified sessionActive. Re-check defensively.
+	if (!sessionActive)
+		return;
+
 	XrFrameWaitInfo waitInfo{ XR_TYPE_FRAME_WAIT_INFO };
 	XrFrameState state{ XR_TYPE_FRAME_STATE };
 
@@ -398,9 +413,6 @@ void XrBackend::WaitForTrackingData()
 
 		// FIXME loop until this returns true?
 		// OOVR_FALSE_ABORT(state.shouldRender);
-
-		XrFrameBeginInfo beginInfo{ XR_TYPE_FRAME_BEGIN_INFO };
-		OOVR_FAILED_XR_ABORT(xrBeginFrame(xr_session.get(), &beginInfo));
 	}
 
 	XrViewLocateInfo locateInfo = { XR_TYPE_VIEW_LOCATE_INFO };
@@ -428,6 +440,19 @@ void XrBackend::WaitForTrackingData()
 		}
 
 		projectionViews[eye].pose = pose;
+	}
+}
+
+void XrBackend::OpenEngineFrameCycle()
+{
+	// Caller has already verified sessionActive. Re-check defensively.
+	if (!sessionActive)
+		return;
+
+	{
+		auto lock = xr_session.lock_shared();
+		XrFrameBeginInfo beginInfo{ XR_TYPE_FRAME_BEGIN_INFO };
+		OOVR_FAILED_XR_ABORT(xrBeginFrame(xr_session.get(), &beginInfo));
 	}
 
 	// If we're not on the game's graphics API yet, don't actually mark us as having started the frame.

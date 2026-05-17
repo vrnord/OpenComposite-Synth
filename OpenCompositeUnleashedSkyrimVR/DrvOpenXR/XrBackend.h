@@ -49,6 +49,21 @@ public:
 	 */
 	static void MaybeRestartForInputs();
 
+	// Phase C2.7a split: separated phases of the OpenXR frame cycle so
+	// the synth submission flow (Phase C2.7b) can do its own
+	// wait/begin/end between the two phases. WaitForTrackingData()
+	// (declared via DECLARE_BACKEND_FUNCS) calls both back-to-back for
+	// the default no-synth flow.
+	//
+	// WaitForTrackingData_WaitAndPoses:
+	//   xrWaitFrame + xrLocateViews + projection view population.
+	// OpenEngineFrameCycle:
+	//   xrBeginFrame + renderingFrame flag setup. Once called, engine's
+	//   frame cycle is open and SubmitFrames must close it with
+	//   xrEndFrame.
+	void WaitForTrackingData_WaitAndPoses();
+	void OpenEngineFrameCycle();
+
 #ifdef SUPPORT_VK
 	static void VkGetPhysicalDevice(VkInstance instance, VkPhysicalDevice* out);
 #endif
