@@ -35,6 +35,12 @@ public:
 	//   - Engine's Submit closes engine's cycle (xrEndFrame)
 	// When false: WGP does wait+locateViews+begin atomically (baseline C2.7a).
 	inline bool SynthDualCycle() const { return synthDualCycle; }
+	// Phase C2.8c-fix2 diagnostic: when true, fill synth swapchain images
+	// with solid magenta via ClearRenderTargetView instead of copying from
+	// CS-Fork's synthColorTex. Used to isolate whether dual-cycle architecture
+	// is structurally working (magenta visible in HMD between engine frames =
+	// yes) vs. whether the texture copy path is broken (still black = no).
+	inline bool SynthDebugForceMagenta() const { return synthDebugForceMagenta; }
 	inline bool EnableAudioSwitch() const { return enableAudioSwitch; }
 	std::string AudioDeviceName() const { return audioDeviceName; }
 	inline bool EnableInputSmoothing() { return enableInputSmoothing; }
@@ -124,6 +130,8 @@ private:
 	bool synthFallbackSingleThread = false;
 	// Phase C2.8c dual-cycle — see public getter for docs.
 	bool synthDualCycle = false;
+	// Phase C2.8c-fix2 magenta isolation — see public getter for docs.
+	bool synthDebugForceMagenta = false;
 	bool enableAudioSwitch = false;
 	std::string audioDeviceName = "";
 	bool enableInputSmoothing = false;

@@ -102,6 +102,9 @@ public:
 	struct SynthSwapchainState {
 		XrSwapchain swapchain[XruEyeCount] = { XR_NULL_HANDLE, XR_NULL_HANDLE };
 		std::vector<XrSwapchainImageD3D11KHR> images[XruEyeCount];
+		// Phase C2.8c-fix2: RTVs per swapchain image for the magenta debug
+		// ClearRenderTargetView path (cannot Clear without an RTV).
+		std::vector<ID3D11RenderTargetView*> rtvs[XruEyeCount];
 		uint32_t width = 0;
 		uint32_t height = 0;
 		int64_t format = 0;

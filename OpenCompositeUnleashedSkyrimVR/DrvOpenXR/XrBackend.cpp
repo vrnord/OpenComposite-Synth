@@ -493,7 +493,13 @@ bool XrBackend::SynthSwapchain_EnsureInit()
 
 	const uint32_t width = (uint32_t)dx11Comp->GetSrcSize().width;
 	const uint32_t height = (uint32_t)dx11Comp->GetSrcSize().height;
-	const int64_t format = dx11Comp->GetSwapchainFormat();
+
+	// Phase C2.8c-fix2: hardcode synth swapchain format to RGBA16F to match
+	// CS-Fork's synthColorTex (RGBA16F per SynthFrameCS.h). Engine's eye
+	// swapchain is SRGB (format 29) but synthColorTex isn't, so copying
+	// engine-format → synth-format via CopySubresourceRegion silently fails.
+	// SteamVR-OpenXR's supported format list includes RGBA16F (format 10).
+	const int64_t format = (int64_t)DXGI_FORMAT_R16G16B16A16_FLOAT;
 
 	synthSwapchain.width = width;
 	synthSwapchain.height = height;
@@ -543,6 +549,31 @@ bool XrBackend::SynthSwapchain_EnsureInit()
 		    (XrSwapchainImageBaseHeader*)synthSwapchain.images[eye].data()));
 
 		OOVR_LOGF("[SynthDC] eye=%d swapchain created with %u images", eye, imageCount);
+
+		// Phase C2.8c-fix2: create RTVs per swapchain image for the
+		// magenta debug-fill path.
+		synthSwapchain.rtvs[eye].resize(imageCount, nullptr);
+		ID3D11Device* d3dDevice = nullptr;
+		if (imageCount > 0 && synthSwapchain.images[eye][0].texture) {
+			synthSwapchain.images[eye][0].texture->GetDevice(&d3dDevice);
+		}
+		if (d3dDevice) {
+			for (uint32_t i = 0; i < imageCount; i++) {
+				D3D11_RENDER_TARGET_VIEW_DESC rtvDesc{};
+				rtvDesc.Format = (DXGI_FORMAT)format;
+				rtvDesc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+				rtvDesc.Texture2D.MipSlice = 0;
+				HRESULT hr = d3dDevice->CreateRenderTargetView(
+				    synthSwapchain.images[eye][i].texture,
+				    &rtvDesc,
+				    &synthSwapchain.rtvs[eye][i]);
+				if (FAILED(hr)) {
+					OOVR_LOGF("[SynthDC] eye=%d image=%u CreateRenderTargetView failed hr=0x%08x",
+					    eye, i, (unsigned)hr);
+				}
+			}
+			d3dDevice->Release();
+		}
 	}
 
 	return true;
@@ -555,6 +586,10 @@ void XrBackend::SynthSwapchain_Shutdown()
 {
 #if defined(SUPPORT_DX) && defined(SUPPORT_DX11)
 	for (int eye = 0; eye < XruEyeCount; eye++) {
+		for (ID3D11RenderTargetView* rtv : synthSwapchain.rtvs[eye]) {
+			if (rtv) rtv->Release();
+		}
+		synthSwapchain.rtvs[eye].clear();
 		synthSwapchain.images[eye].clear();
 		if (synthSwapchain.swapchain[eye] != XR_NULL_HANDLE) {
 			xrDestroySwapchain(synthSwapchain.swapchain[eye]);
@@ -668,6 +703,27 @@ void XrBackend::CloseSynthCycleAndOpenEngineCycle(
 	ID3D11DeviceContext* context = nullptr;
 	device->GetImmediateContext(&context);
 
+	// Phase C2.8c-fix2: diagnostic log of source tex state. Confirms the H4
+	// hook is firing with valid data and that source format matches our
+	// synth swapchain format (10 = DXGI_FORMAT_R16G16B16A16_FLOAT).
+	{
+		static uint64_t s_diagLogCount = 0;
+		if (s_diagLogCount < 5 || (s_diagLogCount % 600) == 0) {
+			D3D11_TEXTURE2D_DESC srcDesc{};
+			d3dSourceTex->GetDesc(&srcDesc);
+			OOVR_LOGF("[SynthDC] source tex=%p width=%u height=%u format=%d "
+			    "(synth swapchain format=%lld) boundsL=[%.2f,%.2f,%.2f,%.2f] boundsR=[%.2f,%.2f,%.2f,%.2f]",
+			    (void*)d3dSourceTex, srcDesc.Width, srcDesc.Height, (int)srcDesc.Format,
+			    (long long)synthSwapchain.format,
+			    boundsLeft->uMin, boundsLeft->vMin, boundsLeft->uMax, boundsLeft->vMax,
+			    boundsRight->uMin, boundsRight->vMin, boundsRight->uMax, boundsRight->vMax);
+		}
+		s_diagLogCount++;
+	}
+
+	const bool forceMagenta = oovr_global_configuration.SynthDebugForceMagenta();
+	const float magentaColor[4] = { 1.0f, 0.0f, 1.0f, 1.0f };
+
 	for (int eye = 0; eye < XruEyeCount; eye++) {
 		XrSwapchain sc = synthSwapchain.swapchain[eye];
 
@@ -690,12 +746,21 @@ void XrBackend::CloseSynthCycleAndOpenEngineCycle(
 		srcBox.front  = 0;
 		srcBox.back   = 1;
 
-		context->CopySubresourceRegion(
-		    synthSwapchain.images[eye][index].texture,
-		    0, 0, 0, 0,
-		    d3dSourceTex,
-		    0,
-		    &srcBox);
+		if (forceMagenta) {
+			// Diagnostic: fill with magenta via ClearRenderTargetView. If magenta
+			// appears in HMD between engine frames, the dual-cycle architecture
+			// is working end-to-end and only the source texture copy is the issue.
+			if (index < synthSwapchain.rtvs[eye].size() && synthSwapchain.rtvs[eye][index]) {
+				context->ClearRenderTargetView(synthSwapchain.rtvs[eye][index], magentaColor);
+			}
+		} else {
+			context->CopySubresourceRegion(
+			    synthSwapchain.images[eye][index].texture,
+			    0, 0, 0, 0,
+			    d3dSourceTex,
+			    0,
+			    &srcBox);
+		}
 
 		XrSwapchainImageReleaseInfo releaseInfo{ XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
 		OOVR_FAILED_XR_ABORT(xrReleaseSwapchainImage(sc, &releaseInfo));
