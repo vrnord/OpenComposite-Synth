@@ -494,6 +494,26 @@ bool XrBackend::SynthSwapchain_EnsureInit()
 	const uint32_t width = (uint32_t)dx11Comp->GetSrcSize().width;
 	const uint32_t height = (uint32_t)dx11Comp->GetSrcSize().height;
 
+	// Phase C2.8c-fix3: compositors[0] non-null does NOT imply its
+	// CheckCreateSwapChain has populated createInfo. Engine's first eye
+	// Submit may go through CheckOrInitCompositors (creating the
+	// DX11Compositor) but skip the inner Invoke that fills createInfo if
+	// !sessionActive || !renderingFrame at that time (e.g. during the
+	// D3D11 session-recreate at XrBackend.cpp:197). Without this guard,
+	// fix2's hardcoded non-zero format defeated fix1's retry mechanism,
+	// causing 0x0 xrCreateSwapchain → runtime corruption → access violation.
+	if (width == 0 || height == 0) {
+		static uint64_t s_zeroDimLogCount = 0;
+		if (s_zeroDimLogCount < 10) {
+			OOVR_LOGF("[SynthDC] EnsureInit: engine compositor has zero dimensions "
+				"(width=%u height=%u) — CheckCreateSwapChain not yet called for "
+				"this compositor, retry next frame",
+				width, height);
+		}
+		s_zeroDimLogCount++;
+		return false;
+	}
+
 	// Phase C2.8c-fix2: hardcode synth swapchain format to RGBA16F to match
 	// CS-Fork's synthColorTex (RGBA16F per SynthFrameCS.h). Engine's eye
 	// swapchain is SRGB (format 29) but synthColorTex isn't, so copying
@@ -505,16 +525,8 @@ bool XrBackend::SynthSwapchain_EnsureInit()
 	synthSwapchain.height = height;
 	synthSwapchain.format = format;
 
-	if (format == 0) {
-		// Engine's swapchain hasn't been created yet (CheckCreateSwapChain
-		// runs on first eye submission). Bail and retry next frame.
-		OOVR_LOGF("[SynthDC] EnsureInit: engine swapchain format is 0 "
-			"(engine swapchain not yet created), retry next frame");
-		return false;
-	}
-
 	OOVR_LOGF("[SynthDC] creating synth swapchains: width=%u height=%u "
-		"openxr_format=%lld (engine swapchain's actual format)",
+		"openxr_format=%lld (RGBA16F, hardcoded to match synthColorTex)",
 		width, height, (long long)format);
 
 	auto lock = xr_session.lock_shared();
