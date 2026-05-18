@@ -37,10 +37,14 @@ public:
 
 	virtual XrExtent2Df GetSrcSize() { return { (float)createInfo.width, (float)createInfo.height }; }
 
-	// Phase C2.8c: format the live swapchain was created with. Used by
-	// XrBackend::SynthSwapchain_EnsureInit to allocate dual-cycle synth
-	// swapchains matching engine's eye-swapchain format.
-	virtual int64_t GetSwapchainFormat() const { return createInfoFormat; }
+	// Phase C2.8c-fix1: format the live OpenXR swapchain was actually
+	// created with. We return createInfo.format (the value passed to
+	// xrCreateSwapchain that succeeded) rather than createInfoFormat
+	// (which is the GAME's source DXGI format — may be a typeless or
+	// non-SRGB variant the runtime doesn't accept for swapchains).
+	// Engine's CheckCreateSwapChain maps source -> SRGB via GetFormatInfo
+	// before calling xrCreateSwapchain.
+	virtual int64_t GetSwapchainFormat() const { return createInfo.format; }
 	/**
 	 * Loads and unloads some context required for submitting textures to LibOVR. LoadSubmitContext is
 	 *  called before calling either Invoke or ovr_CommitTextureSwapChain, and ResetSubmitContext after

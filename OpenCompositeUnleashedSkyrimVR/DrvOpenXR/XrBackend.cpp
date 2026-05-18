@@ -499,7 +499,16 @@ bool XrBackend::SynthSwapchain_EnsureInit()
 	synthSwapchain.height = height;
 	synthSwapchain.format = format;
 
-	OOVR_LOGF("[SynthDC] creating synth swapchains: width=%u height=%u format=%lld",
+	if (format == 0) {
+		// Engine's swapchain hasn't been created yet (CheckCreateSwapChain
+		// runs on first eye submission). Bail and retry next frame.
+		OOVR_LOGF("[SynthDC] EnsureInit: engine swapchain format is 0 "
+			"(engine swapchain not yet created), retry next frame");
+		return false;
+	}
+
+	OOVR_LOGF("[SynthDC] creating synth swapchains: width=%u height=%u "
+		"openxr_format=%lld (engine swapchain's actual format)",
 		width, height, (long long)format);
 
 	auto lock = xr_session.lock_shared();
