@@ -182,6 +182,7 @@ int Config::ini_handler(void* user, const char* pSection,
 		CFGOPT(float, hiddenMeshVerticalScale);
 		CFGOPT(bool, logAllOpenVRCalls);
 		CFGOPT(bool, synthFallbackSingleThread);
+		CFGOPT(bool, synthDualCycle);
 		CFGOPT(bool, enableAudioSwitch);
 		CFGOPT(string, audioDeviceName);
 		CFGOPT(bool, enableInputSmoothing);

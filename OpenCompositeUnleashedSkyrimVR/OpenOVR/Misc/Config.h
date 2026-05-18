@@ -28,6 +28,13 @@ public:
 	// on the calling thread instead of on a dedicated worker thread.
 	// Diagnostic toggle. Default false.
 	inline bool SynthFallbackSingleThread() const { return synthFallbackSingleThread; }
+	// Phase C2.8c: dual-cycle architecture. When true:
+	//   - WGP opens a synth cycle (xrWaitFrame + xrLocateViews + xrBeginFrame)
+	//   - CS-Fork H4 hook calls SubmitSynthAndOpenEngineCycle which closes
+	//     synth (xrEndFrame) then opens engine's cycle (wait+locate+begin)
+	//   - Engine's Submit closes engine's cycle (xrEndFrame)
+	// When false: WGP does wait+locateViews+begin atomically (baseline C2.7a).
+	inline bool SynthDualCycle() const { return synthDualCycle; }
 	inline bool EnableAudioSwitch() const { return enableAudioSwitch; }
 	std::string AudioDeviceName() const { return audioDeviceName; }
 	inline bool EnableInputSmoothing() { return enableInputSmoothing; }
@@ -115,6 +122,8 @@ private:
 	bool logAllOpenVRCalls = false;
 	// VRNord/CS-Fork synth submission extension — see public getter for docs.
 	bool synthFallbackSingleThread = false;
+	// Phase C2.8c dual-cycle — see public getter for docs.
+	bool synthDualCycle = false;
 	bool enableAudioSwitch = false;
 	std::string audioDeviceName = "";
 	bool enableInputSmoothing = false;

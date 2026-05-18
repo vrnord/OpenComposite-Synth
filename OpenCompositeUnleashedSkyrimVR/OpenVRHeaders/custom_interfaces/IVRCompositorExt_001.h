@@ -68,6 +68,14 @@ public:
 	// line wouldn't get joined to the args lines below it. Keep this in
 	// one line to ensure the codegen extracts SubmitInterpolatedFrame.
 	virtual EVRCompositorError SubmitInterpolatedFrame(const Texture_t * synthTexture, const VRTextureBounds_t * boundsLeft, const VRTextureBounds_t * boundsRight, const HmdMatrix34_t * pose, double displayTimeOffsetSeconds) = 0;
+
+	// Phase C2.8c dual-cycle: close the synth cycle that was opened in
+	// WaitForTrackingData (copying the given synth texture into the
+	// synth swapchain via per-eye bounds), then open engine's cycle so
+	// engine can continue its normal render path. Called from CS-Fork's
+	// H4 hook after H1+H4 dispatches have produced synth content.
+	// Must be on ONE LINE — codegen parser drops continuations across `(`.
+	virtual void SubmitSynthAndOpenEngineCycle(const Texture_t * synthTexture, const VRTextureBounds_t * boundsLeft, const VRTextureBounds_t * boundsRight) = 0;
 };
 
 static const char * const IVRCompositorExt_Version = "IVRCompositorExt_001";

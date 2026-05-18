@@ -27,6 +27,10 @@
 #include "../OpenOVR/Reimpl/BaseOverlay.h"
 #include "../OpenOVR/Reimpl/BaseSystem.h"
 #include "../OpenOVR/convert.h"
+#include "../OpenOVR/Misc/Config.h"
+#if defined(SUPPORT_DX) && defined(SUPPORT_DX11)
+#include "../OpenOVR/Compositor/dx11compositor.h"
+#endif
 #include "generated/static_bases.gen.h"
 
 #include "generated/interfaces/IVRCompositor_018.h"
@@ -388,13 +392,17 @@ void XrBackend::WaitForTrackingData()
 		return;
 	}
 
-	// Phase C2.7a split: default no-synth flow calls both phases
-	// back-to-back, preserving identical behavior to the pre-split
-	// implementation. The synth submission flow (Phase C2.7b) will
-	// instead call WaitForTrackingData_WaitAndPoses() here, perform a
-	// synth wait/begin/end cycle, then call OpenEngineFrameCycle().
-	WaitForTrackingData_WaitAndPoses();
-	OpenEngineFrameCycle();
+	if (oovr_global_configuration.SynthDualCycle()) {
+		// Phase C2.8c: open synth cycle. CS-Fork's H4 hook (or SubmitFrames
+		// fallback) will close it and open engine's cycle. renderingFrame
+		// stays false until engine cycle opens, so StoreEyeTexture won't
+		// try to write before it's safe.
+		OpenSynthCycle();
+	} else {
+		// Phase C2.7a baseline: no-synth flow calls both phases back-to-back.
+		WaitForTrackingData_WaitAndPoses();
+		OpenEngineFrameCycle();
+	}
 }
 
 void XrBackend::WaitForTrackingData_WaitAndPoses()
@@ -464,6 +472,373 @@ void XrBackend::OpenEngineFrameCycle()
 	}
 }
 
+// === Phase C2.8c dual-cycle helpers ===
+
+bool XrBackend::SynthSwapchain_EnsureInit()
+{
+#if defined(SUPPORT_DX) && defined(SUPPORT_DX11)
+	if (synthSwapchain.swapchain[0] != XR_NULL_HANDLE)
+		return true;
+
+	if (!compositors[0]) {
+		OOVR_LOGF("[SynthDC] EnsureInit: engine compositor[0] not ready yet");
+		return false;
+	}
+
+	DX11Compositor* dx11Comp = dynamic_cast<DX11Compositor*>(compositors[0].get());
+	if (!dx11Comp) {
+		OOVR_LOGF("[SynthDC] EnsureInit: engine compositor[0] is not DX11Compositor — only DX11 supported");
+		return false;
+	}
+
+	const uint32_t width = (uint32_t)dx11Comp->GetSrcSize().width;
+	const uint32_t height = (uint32_t)dx11Comp->GetSrcSize().height;
+	const int64_t format = dx11Comp->GetSwapchainFormat();
+
+	synthSwapchain.width = width;
+	synthSwapchain.height = height;
+	synthSwapchain.format = format;
+
+	OOVR_LOGF("[SynthDC] creating synth swapchains: width=%u height=%u format=%lld",
+		width, height, (long long)format);
+
+	auto lock = xr_session.lock_shared();
+	XrSession session = xr_session.get();
+	for (int eye = 0; eye < XruEyeCount; eye++) {
+		XrSwapchainCreateInfo info{ XR_TYPE_SWAPCHAIN_CREATE_INFO };
+		info.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT
+		    | XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT
+		    | XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
+		info.format = format;
+		info.sampleCount = 1;
+		info.width = width;
+		info.height = height;
+		info.faceCount = 1;
+		info.arraySize = 1;
+		info.mipCount = 1;
+
+		XrResult cr = xrCreateSwapchain(session, &info, &synthSwapchain.swapchain[eye]);
+		if (XR_FAILED(cr)) {
+			char buf[XR_MAX_RESULT_STRING_SIZE] = "";
+			xrResultToString(xr_instance, cr, buf);
+			OOVR_LOGF("[SynthDC] xrCreateSwapchain eye=%d failed: result=%d (%s)",
+				eye, (int)cr, buf);
+			SynthSwapchain_Shutdown();
+			return false;
+		}
+
+		uint32_t imageCount = 0;
+		OOVR_FAILED_XR_ABORT(xrEnumerateSwapchainImages(synthSwapchain.swapchain[eye], 0, &imageCount, nullptr));
+		synthSwapchain.images[eye].resize(imageCount, { XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR });
+		OOVR_FAILED_XR_ABORT(xrEnumerateSwapchainImages(synthSwapchain.swapchain[eye], imageCount, &imageCount,
+		    (XrSwapchainImageBaseHeader*)synthSwapchain.images[eye].data()));
+
+		OOVR_LOGF("[SynthDC] eye=%d swapchain created with %u images", eye, imageCount);
+	}
+
+	return true;
+#else
+	return false;
+#endif
+}
+
+void XrBackend::SynthSwapchain_Shutdown()
+{
+#if defined(SUPPORT_DX) && defined(SUPPORT_DX11)
+	for (int eye = 0; eye < XruEyeCount; eye++) {
+		synthSwapchain.images[eye].clear();
+		if (synthSwapchain.swapchain[eye] != XR_NULL_HANDLE) {
+			xrDestroySwapchain(synthSwapchain.swapchain[eye]);
+			synthSwapchain.swapchain[eye] = XR_NULL_HANDLE;
+		}
+	}
+#endif
+}
+
+void XrBackend::OpenSynthCycle()
+{
+	if (!sessionActive) return;
+	if (synthCyclePending.load()) {
+		OOVR_LOGF("[SynthDC] OpenSynthCycle called but synth cycle already pending — skipping");
+		return;
+	}
+	if (engineCycleOpen.load()) {
+		OOVR_LOGF("[SynthDC] OpenSynthCycle called but engine cycle already open — skipping");
+		return;
+	}
+
+	auto lock = xr_session.lock_shared();
+	XrSession session = xr_session.get();
+
+	XrFrameWaitInfo waitInfo{ XR_TYPE_FRAME_WAIT_INFO };
+	XrFrameState state{ XR_TYPE_FRAME_STATE };
+	XrResult wr = xrWaitFrame(session, &waitInfo, &state);
+	if (XR_FAILED(wr)) {
+		char buf[XR_MAX_RESULT_STRING_SIZE] = "";
+		xrResultToString(xr_instance, wr, buf);
+		OOVR_LOGF("[SynthDC] OpenSynthCycle xrWaitFrame failed: %d (%s)", (int)wr, buf);
+		return;
+	}
+
+	// Synth's wait fills xr_gbl->nextPredictedFrameTime; engine's later wait
+	// will overwrite this with engine's slot time.
+	xr_gbl->nextPredictedFrameTime = state.predictedDisplayTime;
+
+	// Locate views for synth's slot. (Spike: engine reuses these poses for
+	// its render; refinement would locate twice — once per slot.)
+	XrViewLocateInfo locateInfo = { XR_TYPE_VIEW_LOCATE_INFO };
+	locateInfo.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+	locateInfo.displayTime = state.predictedDisplayTime;
+	locateInfo.space = xr_space_from_ref_space_type(GetUnsafeBaseSystem()->currentSpace);
+	XrViewState viewState = { XR_TYPE_VIEW_STATE };
+	uint32_t viewCount = 0;
+	XrView views[XruEyeCount] = { { XR_TYPE_VIEW }, { XR_TYPE_VIEW } };
+	OOVR_FAILED_XR_SOFT_ABORT(xrLocateViews(session, &locateInfo, &viewState, XruEyeCount, &viewCount, views));
+
+	for (int eye = 0; eye < XruEyeCount; eye++) {
+		projectionViews[eye].fov = views[eye].fov;
+		XrPosef pose = views[eye].pose;
+		if ((viewState.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT) == 0)
+			pose.orientation = XrQuaternionf{ 0, 0, 0, 1 };
+		if ((viewState.viewStateFlags & XR_VIEW_STATE_POSITION_VALID_BIT) == 0)
+			pose.position = XrVector3f{ 0, 1.75, 0 };
+		projectionViews[eye].pose = pose;
+	}
+
+	XrFrameBeginInfo beginInfo{ XR_TYPE_FRAME_BEGIN_INFO };
+	XrResult br = xrBeginFrame(session, &beginInfo);
+	if (XR_FAILED(br)) {
+		char buf[XR_MAX_RESULT_STRING_SIZE] = "";
+		xrResultToString(xr_instance, br, buf);
+		OOVR_LOGF("[SynthDC] OpenSynthCycle xrBeginFrame failed: %d (%s)", (int)br, buf);
+		return;
+	}
+
+	synthCyclePending.store(true);
+
+	static uint64_t s_logCount = 0;
+	if (s_logCount < 10 || (s_logCount % 300) == 0) {
+		OOVR_LOGF("[SynthDC] synth cycle opened: predictedDisplayTime=%lld",
+			(long long)state.predictedDisplayTime);
+	}
+	s_logCount++;
+}
+
+void XrBackend::CloseSynthCycleAndOpenEngineCycle(
+    const vr::Texture_t* synthTexture,
+    const vr::VRTextureBounds_t* boundsLeft,
+    const vr::VRTextureBounds_t* boundsRight)
+{
+#if defined(SUPPORT_DX) && defined(SUPPORT_DX11)
+	if (!sessionActive) return;
+	if (!synthCyclePending.load()) {
+		OOVR_LOGF("[SynthDC] CloseSynthCycle called but synth cycle not pending — skipping");
+		return;
+	}
+
+	if (!SynthSwapchain_EnsureInit()) {
+		OOVR_LOGF("[SynthDC] synth swapchain init failed — falling back to placeholder");
+		CloseSynthCycleAsPlaceholderAndOpenEngineCycle();
+		return;
+	}
+
+	auto lock = xr_session.lock_shared();
+	XrSession session = xr_session.get();
+
+	// Capture synth displayTime BEFORE engine's wait stomps xr_gbl->nextPredictedFrameTime.
+	const int64_t synthDisplayTime = (int64_t)xr_gbl->nextPredictedFrameTime;
+
+	XrCompositionLayerProjectionView synthViews[XruEyeCount] = {
+		{ XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW },
+		{ XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW }
+	};
+
+	auto* d3dSourceTex = (ID3D11Texture2D*)synthTexture->handle;
+	ID3D11Device* device = nullptr;
+	d3dSourceTex->GetDevice(&device);
+	ID3D11DeviceContext* context = nullptr;
+	device->GetImmediateContext(&context);
+
+	for (int eye = 0; eye < XruEyeCount; eye++) {
+		XrSwapchain sc = synthSwapchain.swapchain[eye];
+
+		XrSwapchainImageAcquireInfo acquireInfo{ XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO };
+		uint32_t index = 0;
+		OOVR_FAILED_XR_ABORT(xrAcquireSwapchainImage(sc, &acquireInfo, &index));
+
+		XrSwapchainImageWaitInfo waitInfo{ XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO };
+		waitInfo.timeout = XR_INFINITE_DURATION;
+		OOVR_FAILED_XR_ABORT(xrWaitSwapchainImage(sc, &waitInfo));
+
+		const vr::VRTextureBounds_t* bounds = (eye == 0) ? boundsLeft : boundsRight;
+		D3D11_TEXTURE2D_DESC sourceDesc{};
+		d3dSourceTex->GetDesc(&sourceDesc);
+		D3D11_BOX srcBox{};
+		srcBox.left   = (UINT)(bounds->uMin * sourceDesc.Width);
+		srcBox.right  = (UINT)(bounds->uMax * sourceDesc.Width);
+		srcBox.top    = (UINT)(bounds->vMin * sourceDesc.Height);
+		srcBox.bottom = (UINT)(bounds->vMax * sourceDesc.Height);
+		srcBox.front  = 0;
+		srcBox.back   = 1;
+
+		context->CopySubresourceRegion(
+		    synthSwapchain.images[eye][index].texture,
+		    0, 0, 0, 0,
+		    d3dSourceTex,
+		    0,
+		    &srcBox);
+
+		XrSwapchainImageReleaseInfo releaseInfo{ XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
+		OOVR_FAILED_XR_ABORT(xrReleaseSwapchainImage(sc, &releaseInfo));
+
+		synthViews[eye] = projectionViews[eye];
+		synthViews[eye].type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;
+		synthViews[eye].subImage.swapchain = sc;
+		synthViews[eye].subImage.imageRect.offset = { 0, 0 };
+		synthViews[eye].subImage.imageRect.extent = {
+		    (int32_t)synthSwapchain.width, (int32_t)synthSwapchain.height
+		};
+		synthViews[eye].subImage.imageArrayIndex = 0;
+	}
+
+	context->Release();
+	device->Release();
+
+	XrCompositionLayerProjection synthLayer{ XR_TYPE_COMPOSITION_LAYER_PROJECTION };
+	synthLayer.space = xr_space_from_ref_space_type(GetUnsafeBaseSystem()->currentSpace);
+	synthLayer.viewCount = XruEyeCount;
+	synthLayer.views = synthViews;
+
+	const XrCompositionLayerBaseHeader* synthLayerPtr =
+	    (const XrCompositionLayerBaseHeader*)&synthLayer;
+
+	XrFrameEndInfo endInfo{ XR_TYPE_FRAME_END_INFO };
+	endInfo.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+	endInfo.displayTime = (XrTime)synthDisplayTime;
+	endInfo.layerCount = 1;
+	endInfo.layers = &synthLayerPtr;
+	XrResult er = xrEndFrame(session, &endInfo);
+	if (XR_FAILED(er)) {
+		char buf[XR_MAX_RESULT_STRING_SIZE] = "";
+		xrResultToString(xr_instance, er, buf);
+		OOVR_LOGF("[SynthDC] synth xrEndFrame failed: %d (%s) synthDisplayTime=%lld",
+			(int)er, buf, (long long)synthDisplayTime);
+		// Continue — still must clear flag + open engine cycle.
+	}
+	synthCyclePending.store(false);
+
+	// === Open engine cycle (wait + locateViews + begin) ===
+	XrFrameWaitInfo eWaitInfo{ XR_TYPE_FRAME_WAIT_INFO };
+	XrFrameState eState{ XR_TYPE_FRAME_STATE };
+	XrResult ewr = xrWaitFrame(session, &eWaitInfo, &eState);
+	if (XR_FAILED(ewr)) {
+		char buf[XR_MAX_RESULT_STRING_SIZE] = "";
+		xrResultToString(xr_instance, ewr, buf);
+		OOVR_LOGF("[SynthDC] engine xrWaitFrame failed: %d (%s)", (int)ewr, buf);
+		return;
+	}
+
+	xr_gbl->nextPredictedFrameTime = eState.predictedDisplayTime;
+	engineCyclePredictedTime.store((int64_t)eState.predictedDisplayTime);
+
+	XrViewLocateInfo eLocateInfo = { XR_TYPE_VIEW_LOCATE_INFO };
+	eLocateInfo.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+	eLocateInfo.displayTime = eState.predictedDisplayTime;
+	eLocateInfo.space = xr_space_from_ref_space_type(GetUnsafeBaseSystem()->currentSpace);
+	XrViewState eViewState = { XR_TYPE_VIEW_STATE };
+	uint32_t eViewCount = 0;
+	XrView eViews[XruEyeCount] = { { XR_TYPE_VIEW }, { XR_TYPE_VIEW } };
+	OOVR_FAILED_XR_SOFT_ABORT(xrLocateViews(session, &eLocateInfo, &eViewState, XruEyeCount, &eViewCount, eViews));
+
+	for (int eye = 0; eye < XruEyeCount; eye++) {
+		projectionViews[eye].fov = eViews[eye].fov;
+		XrPosef pose = eViews[eye].pose;
+		if ((eViewState.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT) == 0)
+			pose.orientation = XrQuaternionf{ 0, 0, 0, 1 };
+		if ((eViewState.viewStateFlags & XR_VIEW_STATE_POSITION_VALID_BIT) == 0)
+			pose.position = XrVector3f{ 0, 1.75, 0 };
+		projectionViews[eye].pose = pose;
+	}
+
+	XrFrameBeginInfo eBeginInfo{ XR_TYPE_FRAME_BEGIN_INFO };
+	XrResult ebr = xrBeginFrame(session, &eBeginInfo);
+	if (XR_FAILED(ebr)) {
+		char buf[XR_MAX_RESULT_STRING_SIZE] = "";
+		xrResultToString(xr_instance, ebr, buf);
+		OOVR_LOGF("[SynthDC] engine xrBeginFrame failed: %d (%s)", (int)ebr, buf);
+		return;
+	}
+	engineCycleOpen.store(true);
+
+	if (!usingApplicationGraphicsAPI)
+		deferredRenderingStart = true;
+	else
+		renderingFrame = true;
+
+	static uint64_t s_logCount = 0;
+	if (s_logCount < 10 || (s_logCount % 300) == 0) {
+		OOVR_LOGF("[SynthDC] cycle pair: synthDisplayTime=%lld engineDisplayTime=%lld delta=%lld",
+			(long long)synthDisplayTime,
+			(long long)eState.predictedDisplayTime,
+			(long long)((int64_t)eState.predictedDisplayTime - synthDisplayTime));
+	}
+	s_logCount++;
+#endif
+}
+
+void XrBackend::CloseSynthCycleAsPlaceholderAndOpenEngineCycle()
+{
+	if (!sessionActive) return;
+	if (!synthCyclePending.load()) return;
+
+	auto lock = xr_session.lock_shared();
+	XrSession session = xr_session.get();
+
+	const int64_t synthDisplayTime = (int64_t)xr_gbl->nextPredictedFrameTime;
+
+	XrFrameEndInfo endInfo{ XR_TYPE_FRAME_END_INFO };
+	endInfo.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+	endInfo.displayTime = (XrTime)synthDisplayTime;
+	endInfo.layerCount = 0;
+	endInfo.layers = nullptr;
+	OOVR_FAILED_XR_SOFT_ABORT(xrEndFrame(session, &endInfo));
+	synthCyclePending.store(false);
+
+	XrFrameWaitInfo eWaitInfo{ XR_TYPE_FRAME_WAIT_INFO };
+	XrFrameState eState{ XR_TYPE_FRAME_STATE };
+	OOVR_FAILED_XR_ABORT(xrWaitFrame(session, &eWaitInfo, &eState));
+	xr_gbl->nextPredictedFrameTime = eState.predictedDisplayTime;
+	engineCyclePredictedTime.store((int64_t)eState.predictedDisplayTime);
+
+	XrViewLocateInfo eLocateInfo = { XR_TYPE_VIEW_LOCATE_INFO };
+	eLocateInfo.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+	eLocateInfo.displayTime = eState.predictedDisplayTime;
+	eLocateInfo.space = xr_space_from_ref_space_type(GetUnsafeBaseSystem()->currentSpace);
+	XrViewState eViewState = { XR_TYPE_VIEW_STATE };
+	uint32_t eViewCount = 0;
+	XrView eViews[XruEyeCount] = { { XR_TYPE_VIEW }, { XR_TYPE_VIEW } };
+	OOVR_FAILED_XR_SOFT_ABORT(xrLocateViews(session, &eLocateInfo, &eViewState, XruEyeCount, &eViewCount, eViews));
+
+	for (int eye = 0; eye < XruEyeCount; eye++) {
+		projectionViews[eye].fov = eViews[eye].fov;
+		XrPosef pose = eViews[eye].pose;
+		if ((eViewState.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT) == 0)
+			pose.orientation = XrQuaternionf{ 0, 0, 0, 1 };
+		if ((eViewState.viewStateFlags & XR_VIEW_STATE_POSITION_VALID_BIT) == 0)
+			pose.position = XrVector3f{ 0, 1.75, 0 };
+		projectionViews[eye].pose = pose;
+	}
+
+	XrFrameBeginInfo eBeginInfo{ XR_TYPE_FRAME_BEGIN_INFO };
+	OOVR_FAILED_XR_ABORT(xrBeginFrame(session, &eBeginInfo));
+	engineCycleOpen.store(true);
+
+	if (!usingApplicationGraphicsAPI)
+		deferredRenderingStart = true;
+	else
+		renderingFrame = true;
+}
+
 void XrBackend::StoreEyeTexture(
     vr::EVREye eye,
     const vr::Texture_t* texture,
@@ -510,6 +885,15 @@ void XrBackend::SubmitFrames(bool showSkybox, bool postPresent)
 	//  there will be other data such as GUI layers to be added before ending the frame.
 	bool skipRender = postPresentStatus && !postPresent;
 	postPresentStatus = postPresent;
+
+	// Phase C2.8c fallback: if synth cycle was opened but never closed
+	// (CS-Fork H4 hook didn't fire — toggle off mid-frame, extension not
+	// connected, hook conditions not met), close it now with a placeholder
+	// and open engine cycle inline so this SubmitFrames can close it.
+	if (oovr_global_configuration.SynthDualCycle()
+	    && synthCyclePending.load() && !engineCycleOpen.load()) {
+		CloseSynthCycleAsPlaceholderAndOpenEngineCycle();
+	}
 
 	if (!renderingFrame || skipRender)
 		return;
@@ -574,7 +958,19 @@ void XrBackend::SubmitFrames(bool showSkybox, bool postPresent)
 	info.layers = headers;
 	info.layerCount = layer_count;
 
+	// Phase C2.8c: in dual-cycle mode, engine's displayTime came from engine's
+	// xrWaitFrame (stashed in engineCyclePredictedTime). xr_gbl->nextPredictedFrameTime
+	// may still hold synth's wait result if engine's wait was the most-recent
+	// thing to touch it — but the safe value is the one we explicitly stashed.
+	if (oovr_global_configuration.SynthDualCycle()) {
+		int64_t enginePred = engineCyclePredictedTime.load();
+		if (enginePred > 0) {
+			info.displayTime = (XrTime)enginePred;
+		}
+	}
+
 	OOVR_FAILED_XR_SOFT_ABORT(xrEndFrame(xr_session.get(), &info));
+	engineCycleOpen.store(false);
 
 	// Record engine's submitted displayTime for the synth thread to anchor
 	// against. The synth thread will target a time half a frame interval
@@ -911,6 +1307,9 @@ void XrBackend::OnSessionCreated()
 
 void XrBackend::PrepareForSessionShutdown()
 {
+	// Phase C2.8c: destroy dual-cycle synth swapchains before primary teardown.
+	SynthSwapchain_Shutdown();
+
 	// Stop synth submission worker thread first, before tearing down any
 	// session resources it may be using (VRNord/CS-Fork extension).
 	BaseCompositorExt::StopSynthThread();

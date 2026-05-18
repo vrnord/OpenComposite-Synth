@@ -30,6 +30,18 @@ public:
 		double displayTimeOffsetSeconds
 	);
 
+	// Phase C2.8c: dual-cycle synth submission. Closes the synth OpenXR
+	// cycle that WaitForTrackingData opened, copies the given texture into
+	// the synth swapchain via per-eye bounds, then opens engine's cycle so
+	// engine's normal Submit path can close it. Called from CS-Fork's H4
+	// hook. Non-virtual by Base convention — the codegen-generated
+	// CVRCompositorExt_001 proxy forwards here.
+	void SubmitSynthAndOpenEngineCycle(
+		const vr::Texture_t * synthTexture,
+		const vr::VRTextureBounds_t * boundsLeft,
+		const vr::VRTextureBounds_t * boundsRight
+	);
+
 	// Lifecycle hooks called from XrBackend::OnSessionCreated and
 	// PrepareForSessionShutdown. Idempotent — safe to call repeatedly.
 	// Static because the thread state is per-process, not per-instance

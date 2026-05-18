@@ -12,6 +12,8 @@
 // OpenOVR/ is on the include path (see other Reimpl/*.cpp).
 #include "Misc/Config.h"
 #include "Misc/xrutil.h"
+#include "Drivers/Backend.h"
+#include "../../DrvOpenXR/XrBackend.h"
 
 namespace {
 
@@ -435,4 +437,23 @@ vr::IVRCompositorExt_001::EVRCompositorError BaseCompositorExt::SubmitInterpolat
 	}
 
 	return vr::IVRCompositorExt_001::VRCompositorError_None;
+}
+
+void BaseCompositorExt::SubmitSynthAndOpenEngineCycle(
+	const vr::Texture_t* texture,
+	const vr::VRTextureBounds_t* boundsLeft,
+	const vr::VRTextureBounds_t* boundsRight)
+{
+	if (!texture || !boundsLeft || !boundsRight) {
+		OOVR_LOGF("[SynthDC] SubmitSynthAndOpenEngineCycle: null args — skipping");
+		return;
+	}
+
+	auto* backend = dynamic_cast<XrBackend*>(BackendManager::Instance().GetBackendInstance());
+	if (!backend) {
+		OOVR_LOGF("[SynthDC] no XrBackend instance — skipping");
+		return;
+	}
+
+	backend->CloseSynthCycleAndOpenEngineCycle(texture, boundsLeft, boundsRight);
 }

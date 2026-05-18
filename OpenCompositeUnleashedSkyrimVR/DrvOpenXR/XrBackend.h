@@ -9,7 +9,17 @@
 #include "XrController.h"
 #include "XrHMD.h"
 
+#include <atomic>
 #include <memory>
+#include <vector>
+
+// Phase C2.8c: dual-cycle synth swapchain state stores
+// XrSwapchainImageD3D11KHR per image, which requires the D3D11-enabled
+// OpenXR platform header. Gated to keep the dependency narrow.
+#if defined(SUPPORT_DX) && defined(SUPPORT_DX11)
+#include "../OpenOVR/Misc/xr_ext.h" // defines XR_USE_GRAPHICS_API_D3D11
+#include <openxr/openxr_platform.h>
+#endif
 
 class XrBackend : public IBackend {
 public:
@@ -63,6 +73,50 @@ public:
 	//   xrEndFrame.
 	void WaitForTrackingData_WaitAndPoses();
 	void OpenEngineFrameCycle();
+
+	// Phase C2.8c: dual-cycle architecture state.
+	//
+	// Per engine logical frame, the runtime sees TWO wait/begin/end cycles:
+	//   1. Synth cycle: wait+begin in WaitForTrackingData (via OpenSynthCycle),
+	//      end in CloseSynthCycleAndOpenEngineCycle (called from CS-Fork H4
+	//      hook via SubmitSynthAndOpenEngineCycle).
+	//   2. Engine cycle: wait+begin at the END of CloseSynth..., end in
+	//      SubmitFrames.
+	//
+	// These flags track which cycle is open, so SubmitFrames can detect
+	// the "synth never closed" fallback case (toggle off mid-frame, CS-Fork
+	// hook didn't fire) and recover by closing synth with a placeholder
+	// before opening engine inline.
+	std::atomic<bool> synthCyclePending{ false };
+	std::atomic<bool> engineCycleOpen{ false };
+
+	// Engine's xrWaitFrame predictedDisplayTime, stored separately from
+	// xr_gbl->nextPredictedFrameTime (which gets stomped by synth's wait
+	// in dual-cycle mode). SubmitFrames uses this for its xrEndFrame's
+	// displayTime instead of xr_gbl->nextPredictedFrameTime.
+	std::atomic<int64_t> engineCyclePredictedTime{ 0 };
+
+#if defined(SUPPORT_DX) && defined(SUPPORT_DX11)
+	// Synth swapchain per eye, allocated lazily on first
+	// CloseSynthCycleAndOpenEngineCycle call when synthDualCycle is enabled.
+	struct SynthSwapchainState {
+		XrSwapchain swapchain[XruEyeCount] = { XR_NULL_HANDLE, XR_NULL_HANDLE };
+		std::vector<XrSwapchainImageD3D11KHR> images[XruEyeCount];
+		uint32_t width = 0;
+		uint32_t height = 0;
+		int64_t format = 0;
+	};
+	SynthSwapchainState synthSwapchain;
+#endif
+
+	// Phase C2.8c helpers.
+	bool SynthSwapchain_EnsureInit();
+	void SynthSwapchain_Shutdown();
+	void OpenSynthCycle();
+	void CloseSynthCycleAndOpenEngineCycle(const vr::Texture_t* synthTexture,
+	    const vr::VRTextureBounds_t* boundsLeft,
+	    const vr::VRTextureBounds_t* boundsRight);
+	void CloseSynthCycleAsPlaceholderAndOpenEngineCycle();
 
 #ifdef SUPPORT_VK
 	static void VkGetPhysicalDevice(VkInstance instance, VkPhysicalDevice* out);

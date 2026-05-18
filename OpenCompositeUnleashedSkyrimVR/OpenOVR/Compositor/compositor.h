@@ -36,6 +36,11 @@ public:
 	virtual XrSwapchain GetSwapChain() { return chain; };
 
 	virtual XrExtent2Df GetSrcSize() { return { (float)createInfo.width, (float)createInfo.height }; }
+
+	// Phase C2.8c: format the live swapchain was created with. Used by
+	// XrBackend::SynthSwapchain_EnsureInit to allocate dual-cycle synth
+	// swapchains matching engine's eye-swapchain format.
+	virtual int64_t GetSwapchainFormat() const { return createInfoFormat; }
 	/**
 	 * Loads and unloads some context required for submitting textures to LibOVR. LoadSubmitContext is
 	 *  called before calling either Invoke or ovr_CommitTextureSwapChain, and ResetSubmitContext after
