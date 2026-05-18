@@ -21,6 +21,15 @@
 #include <openxr/openxr_platform.h>
 #endif
 
+// Phase C2.8d-fix1: high-resolution waitable timer for engine throttle.
+// HANDLE type is from Windows.h.
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <Windows.h>
+#endif
+
 class XrBackend : public IBackend {
 public:
 	DECLARE_BACKEND_FUNCS(virtual, override);
@@ -103,6 +112,17 @@ public:
 	// OpenSynthCycle). Both updated only when synthEngineThrottle is enabled.
 	std::atomic<int64_t> tWGPLastEntryNs{ 0 };
 	std::atomic<int64_t> lastDisplayPeriodNs{ 0 };
+
+	// Phase C2.8d-fix1: high-resolution waitable timer for engine throttle.
+	// Lazily created on first throttle invocation, reused thereafter, closed
+	// in destructor. nullptr means either we haven't created it yet OR
+	// CreateWaitableTimerExW failed (extremely unlikely on Win10 1803+ which
+	// is universal in 2026); in the latter case throttleHighResTimerFailed
+	// is true and we fall back to std::this_thread::sleep_for.
+#ifdef _WIN32
+	HANDLE hHighResTimer = nullptr;
+	bool throttleHighResTimerFailed = false;
+#endif
 
 #if defined(SUPPORT_DX) && defined(SUPPORT_DX11)
 	// Synth swapchain per eye, allocated lazily on first

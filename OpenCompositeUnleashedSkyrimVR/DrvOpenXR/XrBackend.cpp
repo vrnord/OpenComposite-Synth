@@ -103,6 +103,14 @@ XrBackend::~XrBackend()
 	// This must happen after session destruction (which occurs in FullShutdown), as runtimes (namely Monado)
 	// may try to access these resources while destroying the session.
 	temporaryGraphics.reset();
+
+	// Phase C2.8d-fix1: release the high-resolution waitable timer if we created one.
+#ifdef _WIN32
+	if (hHighResTimer) {
+		CloseHandle(hHighResTimer);
+		hHighResTimer = nullptr;
+	}
+#endif
 }
 
 XrSessionState XrBackend::GetSessionState()
@@ -629,6 +637,13 @@ void XrBackend::OpenSynthCycle()
 	// completed synth cycle (lastDisplayPeriodNs > 0). On first call
 	// after enable, both atomics are zero, throttle is a no-op and the
 	// "previous" timestamp gets seeded at the bottom of this function.
+	//
+	// Phase C2.8d-fix1: precision sleep via Win32 high-resolution waitable
+	// timer. std::this_thread::sleep_for's precision is bounded by Windows
+	// scheduler quantum (~15.6ms default, ~1ms with timeBeginPeriod(1)),
+	// which is fatal for 11ms targets (90Hz) and worse at higher refresh
+	// rates. CreateWaitableTimerExW with CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+	// (Win10 1803+, universal in 2026) gives 100ns precision.
 	if (oovr_global_configuration.SynthEngineThrottle()) {
 		const int64_t lastEntry = tWGPLastEntryNs.load();
 		const int64_t period = lastDisplayPeriodNs.load();
@@ -639,17 +654,70 @@ void XrBackend::OpenSynthCycle()
 			    clock::now().time_since_epoch()).count();
 			if (nowNs < targetNs) {
 				const int64_t sleepNs = targetNs - nowNs;
-				// Use a Win32 high-resolution sleep. std::this_thread::sleep_for
-				// has poor sub-millisecond accuracy on Windows due to scheduler
-				// quantum (~15.6ms default). Need timeBeginPeriod(1) or use
-				// nanosleep equivalent. For now, sleep_for is good enough for
-				// 11ms+ targets; if jitter is bad we'll switch to waitable timer.
-				std::this_thread::sleep_for(std::chrono::nanoseconds(sleepNs));
+				bool didHighResSleep = false;
+
+#ifdef _WIN32
+				// Lazily create the waitable timer on first use.
+				if (!hHighResTimer && !throttleHighResTimerFailed) {
+					hHighResTimer = CreateWaitableTimerExW(
+					    nullptr,
+					    nullptr,
+					    CREATE_WAITABLE_TIMER_HIGH_RESOLUTION | CREATE_WAITABLE_TIMER_MANUAL_RESET,
+					    TIMER_ALL_ACCESS);
+					if (!hHighResTimer) {
+						const DWORD err = GetLastError();
+						OOVR_LOGF("[SynthDC] WARNING: CreateWaitableTimerExW(HIGH_RESOLUTION) "
+						    "failed (err=%lu) — falling back to std::this_thread::sleep_for "
+						    "for engine throttle; pacing precision will be ~15ms instead of "
+						    "<1ms. This is unexpected on Win10 1803+ and may cause visible "
+						    "frame-pacing jitter.", (unsigned long)err);
+						throttleHighResTimerFailed = true;
+					}
+				}
+
+				if (hHighResTimer) {
+					// SetWaitableTimer takes a LARGE_INTEGER due time in 100ns units.
+					// Negative = relative to now. So sleepNs / 100 negated.
+					LARGE_INTEGER due;
+					due.QuadPart = -(LONGLONG)(sleepNs / 100);
+					if (SetWaitableTimer(hHighResTimer, &due, 0, nullptr, nullptr, FALSE)) {
+						// Timeout cap: ceil(sleepNs/1e6) + 10ms safety margin.
+						// Hitting this means something went wrong; better to
+						// return than block indefinitely.
+						const DWORD timeoutMs = (DWORD)((sleepNs + 999999) / 1000000) + 10;
+						const DWORD waitResult = WaitForSingleObject(hHighResTimer, timeoutMs);
+						if (waitResult == WAIT_OBJECT_0) {
+							didHighResSleep = true;
+						} else {
+							static uint64_t s_waitFailLogCount = 0;
+							if (s_waitFailLogCount < 5) {
+								OOVR_LOGF("[SynthDC] WARNING: WaitForSingleObject on high-res "
+								    "timer returned 0x%08x (expected 0 = WAIT_OBJECT_0); "
+								    "throttle precision may be degraded",
+								    (unsigned)waitResult);
+							}
+							s_waitFailLogCount++;
+						}
+					}
+				}
+#endif
+
+				if (!didHighResSleep) {
+					// Fallback path: best-effort std::this_thread::sleep_for.
+					std::this_thread::sleep_for(std::chrono::nanoseconds(sleepNs));
+				}
 
 				static uint64_t s_throttleLogCount = 0;
 				if (s_throttleLogCount < 5 || (s_throttleLogCount % 600) == 0) {
-					OOVR_LOGF("[SynthDC] throttle: slept %.2fms (target=2x%.2fms display period)",
-					    sleepNs / 1e6, period / 1e6);
+					// Measure the ACTUAL slept duration so we can detect timer
+					// precision issues in the field.
+					const int64_t postNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+					    clock::now().time_since_epoch()).count();
+					const int64_t actualSleepNs = postNs - nowNs;
+					OOVR_LOGF("[SynthDC] throttle: requested %.3fms slept %.3fms "
+					    "(target=2x%.3fms display period, mechanism=%s)",
+					    sleepNs / 1e6, actualSleepNs / 1e6, period / 1e6,
+					    didHighResSleep ? "high-res-timer" : "sleep_for");
 				}
 				s_throttleLogCount++;
 			}
