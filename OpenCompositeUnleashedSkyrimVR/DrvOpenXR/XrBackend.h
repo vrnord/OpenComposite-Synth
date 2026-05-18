@@ -107,11 +107,18 @@ public:
 
 	// Phase C2.8d: throttle state. tWGPLastEntryNs is wall-clock (nanoseconds
 	// since steady_clock epoch) of the most recent OpenSynthCycle entry,
-	// AFTER any sleep. lastDisplayPeriodNs is the most recent
-	// predictedDisplayPeriod from synth's xrWaitFrame (set at end of
-	// OpenSynthCycle). Both updated only when synthEngineThrottle is enabled.
+	// AFTER any sleep. Updated only when synthEngineThrottle is enabled.
+	//
+	// Phase C2.8d-fix2: track the MINIMUM observed predictedDisplayPeriod
+	// from xrWaitFrame, not the most recent value. The runtime inflates the
+	// reported period when an app misses slots (SteamVR adaptive frame
+	// timing), so using "last observed" caused a runaway feedback loop where
+	// our throttle made pacing worse, runtime inflated period further, we
+	// throttled longer, and so on. The minimum cannot exceed the headset's
+	// true native vsync interval, so it converges to the right target.
+	// Initialized to INT64_MAX so the first observed period always wins min().
 	std::atomic<int64_t> tWGPLastEntryNs{ 0 };
-	std::atomic<int64_t> lastDisplayPeriodNs{ 0 };
+	std::atomic<int64_t> minDisplayPeriodNs{ INT64_MAX };
 
 	// Phase C2.8d-fix1: high-resolution waitable timer for engine throttle.
 	// Lazily created on first throttle invocation, reused thereafter, closed

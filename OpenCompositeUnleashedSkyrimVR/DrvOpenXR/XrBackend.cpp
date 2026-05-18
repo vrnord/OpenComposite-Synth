@@ -634,9 +634,10 @@ void XrBackend::OpenSynthCycle()
 
 	// Phase C2.8d: engine throttle. Sleep until >= 2 * display period has
 	// elapsed since the last WGP entry. Requires at least one prior
-	// completed synth cycle (lastDisplayPeriodNs > 0). On first call
-	// after enable, both atomics are zero, throttle is a no-op and the
-	// "previous" timestamp gets seeded at the bottom of this function.
+	// completed synth cycle (minDisplayPeriodNs < INT64_MAX). On first call
+	// after enable, lastEntry is 0 and minDisplayPeriodNs is INT64_MAX, so
+	// throttle is a no-op and these values get seeded at the bottom of
+	// this function.
 	//
 	// Phase C2.8d-fix1: precision sleep via Win32 high-resolution waitable
 	// timer. std::this_thread::sleep_for's precision is bounded by Windows
@@ -646,14 +647,34 @@ void XrBackend::OpenSynthCycle()
 	// (Win10 1803+, universal in 2026) gives 100ns precision.
 	if (oovr_global_configuration.SynthEngineThrottle()) {
 		const int64_t lastEntry = tWGPLastEntryNs.load();
-		const int64_t period = lastDisplayPeriodNs.load();
-		if (lastEntry > 0 && period > 0) {
+		const int64_t period = minDisplayPeriodNs.load();
+		// period < INT64_MAX means we've observed at least one valid period.
+		if (lastEntry > 0 && period > 0 && period < INT64_MAX) {
 			using clock = std::chrono::steady_clock;
 			const int64_t targetNs = lastEntry + 2 * period;
 			const int64_t nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
 			    clock::now().time_since_epoch()).count();
 			if (nowNs < targetNs) {
-				const int64_t sleepNs = targetNs - nowNs;
+				int64_t sleepNs = targetNs - nowNs;
+
+				// Phase C2.8d-fix2: hard sanity ceiling. Caps engine at ~20Hz
+				// floor at any refresh rate. Prevents runaway throttle from
+				// any future pathology (memory corruption, multi-headset
+				// session switch, etc.) producing catastrophic slowdown.
+				// Normal operation should never reach this cap.
+				constexpr int64_t kMaxSleepNs = 50'000'000; // 50ms
+				if (sleepNs > kMaxSleepNs) {
+					static uint64_t s_capLogCount = 0;
+					if (s_capLogCount < 10) {
+						OOVR_LOGF("[SynthDC] WARNING: throttle sleep %.2fms exceeds "
+						    "%.0fms ceiling (min observed period %.3fms) — capping. "
+						    "If this fires often, min-observed-period tracking is broken.",
+						    sleepNs / 1e6, kMaxSleepNs / 1e6, period / 1e6);
+					}
+					s_capLogCount++;
+					sleepNs = kMaxSleepNs;
+				}
+
 				bool didHighResSleep = false;
 
 #ifdef _WIN32
@@ -715,7 +736,7 @@ void XrBackend::OpenSynthCycle()
 					    clock::now().time_since_epoch()).count();
 					const int64_t actualSleepNs = postNs - nowNs;
 					OOVR_LOGF("[SynthDC] throttle: requested %.3fms slept %.3fms "
-					    "(target=2x%.3fms display period, mechanism=%s)",
+					    "(target=2x%.3fms MIN-observed period, mechanism=%s)",
 					    sleepNs / 1e6, actualSleepNs / 1e6, period / 1e6,
 					    didHighResSleep ? "high-res-timer" : "sleep_for");
 				}
@@ -773,21 +794,39 @@ void XrBackend::OpenSynthCycle()
 
 	synthCyclePending.store(true);
 
-	// Phase C2.8d: record this WGP's wall-clock entry and the runtime's
-	// display period for the next call's throttle calculation.
+	// Phase C2.8d-fix2: record this WGP's wall-clock entry and update
+	// the minimum observed predictedDisplayPeriod. Min, not most-recent,
+	// to defeat the SteamVR-inflated-period feedback loop. The runtime
+	// cannot physically report a period shorter than the headset's true
+	// native vsync interval, so min converges to that ground truth.
 	if (oovr_global_configuration.SynthEngineThrottle()) {
 		using clock = std::chrono::steady_clock;
 		const int64_t nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
 		    clock::now().time_since_epoch()).count();
 		tWGPLastEntryNs.store(nowNs);
-		lastDisplayPeriodNs.store((int64_t)state.predictedDisplayPeriod);
+
+		const int64_t newPeriod = (int64_t)state.predictedDisplayPeriod;
+		if (newPeriod > 0) {
+			// CAS-loop to atomically update min. Contended only during the
+			// rare case of period changing — single-writer in practice
+			// (this function called only from engine's WGP thread).
+			int64_t current = minDisplayPeriodNs.load();
+			while (newPeriod < current
+			       && !minDisplayPeriodNs.compare_exchange_weak(current, newPeriod)) {
+				// current was reloaded by compare_exchange_weak; loop until
+				// we win the CAS or someone else lowered min below newPeriod.
+			}
+		}
 	}
 
 	static uint64_t s_logCount = 0;
 	if (s_logCount < 10 || (s_logCount % 300) == 0) {
-		OOVR_LOGF("[SynthDC] synth cycle opened: predictedDisplayTime=%lld predictedDisplayPeriod=%lld",
+		const int64_t minPeriod = minDisplayPeriodNs.load();
+		OOVR_LOGF("[SynthDC] synth cycle opened: predictedDisplayTime=%lld "
+			"predictedDisplayPeriod=%lld minObservedPeriod=%lld",
 			(long long)state.predictedDisplayTime,
-			(long long)state.predictedDisplayPeriod);
+			(long long)state.predictedDisplayPeriod,
+			(long long)(minPeriod < INT64_MAX ? minPeriod : -1));
 	}
 	s_logCount++;
 }
