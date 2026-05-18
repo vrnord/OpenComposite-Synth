@@ -41,6 +41,14 @@ public:
 	// is structurally working (magenta visible in HMD between engine frames =
 	// yes) vs. whether the texture copy path is broken (still black = no).
 	inline bool SynthDebugForceMagenta() const { return synthDebugForceMagenta; }
+	// Phase C2.8d: throttle engine to half display rate so synth content
+	// fills the in-between slots. When true, OpenSynthCycle sleeps at WGP
+	// entry until wall-clock has advanced >= 2 * runtime-reported display
+	// period since the previous WGP entry. Period is read from the most
+	// recent synth-wait's XrFrameState.predictedDisplayPeriod, so this
+	// auto-scales with display refresh rate (90Hz, 120Hz, 72Hz, etc.).
+	// Only meaningful when synthDualCycle=true.
+	inline bool SynthEngineThrottle() const { return synthEngineThrottle; }
 	inline bool EnableAudioSwitch() const { return enableAudioSwitch; }
 	std::string AudioDeviceName() const { return audioDeviceName; }
 	inline bool EnableInputSmoothing() { return enableInputSmoothing; }
@@ -132,6 +140,8 @@ private:
 	bool synthDualCycle = false;
 	// Phase C2.8c-fix2 magenta isolation — see public getter for docs.
 	bool synthDebugForceMagenta = false;
+	// Phase C2.8d engine throttle — see public getter for docs.
+	bool synthEngineThrottle = false;
 	bool enableAudioSwitch = false;
 	std::string audioDeviceName = "";
 	bool enableInputSmoothing = false;

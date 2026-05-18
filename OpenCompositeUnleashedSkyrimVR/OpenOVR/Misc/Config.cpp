@@ -184,6 +184,7 @@ int Config::ini_handler(void* user, const char* pSection,
 		CFGOPT(bool, synthFallbackSingleThread);
 		CFGOPT(bool, synthDualCycle);
 		CFGOPT(bool, synthDebugForceMagenta);
+		CFGOPT(bool, synthEngineThrottle);
 		CFGOPT(bool, enableAudioSwitch);
 		CFGOPT(string, audioDeviceName);
 		CFGOPT(bool, enableInputSmoothing);

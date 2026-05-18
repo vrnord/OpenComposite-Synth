@@ -47,6 +47,7 @@
 
 #include <chrono>
 #include <ranges>
+#include <thread>
 #include <type_traits>
 
 using namespace vr;
@@ -623,6 +624,38 @@ void XrBackend::OpenSynthCycle()
 		return;
 	}
 
+	// Phase C2.8d: engine throttle. Sleep until >= 2 * display period has
+	// elapsed since the last WGP entry. Requires at least one prior
+	// completed synth cycle (lastDisplayPeriodNs > 0). On first call
+	// after enable, both atomics are zero, throttle is a no-op and the
+	// "previous" timestamp gets seeded at the bottom of this function.
+	if (oovr_global_configuration.SynthEngineThrottle()) {
+		const int64_t lastEntry = tWGPLastEntryNs.load();
+		const int64_t period = lastDisplayPeriodNs.load();
+		if (lastEntry > 0 && period > 0) {
+			using clock = std::chrono::steady_clock;
+			const int64_t targetNs = lastEntry + 2 * period;
+			const int64_t nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+			    clock::now().time_since_epoch()).count();
+			if (nowNs < targetNs) {
+				const int64_t sleepNs = targetNs - nowNs;
+				// Use a Win32 high-resolution sleep. std::this_thread::sleep_for
+				// has poor sub-millisecond accuracy on Windows due to scheduler
+				// quantum (~15.6ms default). Need timeBeginPeriod(1) or use
+				// nanosleep equivalent. For now, sleep_for is good enough for
+				// 11ms+ targets; if jitter is bad we'll switch to waitable timer.
+				std::this_thread::sleep_for(std::chrono::nanoseconds(sleepNs));
+
+				static uint64_t s_throttleLogCount = 0;
+				if (s_throttleLogCount < 5 || (s_throttleLogCount % 600) == 0) {
+					OOVR_LOGF("[SynthDC] throttle: slept %.2fms (target=2x%.2fms display period)",
+					    sleepNs / 1e6, period / 1e6);
+				}
+				s_throttleLogCount++;
+			}
+		}
+	}
+
 	auto lock = xr_session.lock_shared();
 	XrSession session = xr_session.get();
 
@@ -672,10 +705,21 @@ void XrBackend::OpenSynthCycle()
 
 	synthCyclePending.store(true);
 
+	// Phase C2.8d: record this WGP's wall-clock entry and the runtime's
+	// display period for the next call's throttle calculation.
+	if (oovr_global_configuration.SynthEngineThrottle()) {
+		using clock = std::chrono::steady_clock;
+		const int64_t nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+		    clock::now().time_since_epoch()).count();
+		tWGPLastEntryNs.store(nowNs);
+		lastDisplayPeriodNs.store((int64_t)state.predictedDisplayPeriod);
+	}
+
 	static uint64_t s_logCount = 0;
 	if (s_logCount < 10 || (s_logCount % 300) == 0) {
-		OOVR_LOGF("[SynthDC] synth cycle opened: predictedDisplayTime=%lld",
-			(long long)state.predictedDisplayTime);
+		OOVR_LOGF("[SynthDC] synth cycle opened: predictedDisplayTime=%lld predictedDisplayPeriod=%lld",
+			(long long)state.predictedDisplayTime,
+			(long long)state.predictedDisplayPeriod);
 	}
 	s_logCount++;
 }

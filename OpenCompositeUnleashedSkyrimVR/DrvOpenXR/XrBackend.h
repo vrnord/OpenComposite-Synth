@@ -96,6 +96,14 @@ public:
 	// displayTime instead of xr_gbl->nextPredictedFrameTime.
 	std::atomic<int64_t> engineCyclePredictedTime{ 0 };
 
+	// Phase C2.8d: throttle state. tWGPLastEntryNs is wall-clock (nanoseconds
+	// since steady_clock epoch) of the most recent OpenSynthCycle entry,
+	// AFTER any sleep. lastDisplayPeriodNs is the most recent
+	// predictedDisplayPeriod from synth's xrWaitFrame (set at end of
+	// OpenSynthCycle). Both updated only when synthEngineThrottle is enabled.
+	std::atomic<int64_t> tWGPLastEntryNs{ 0 };
+	std::atomic<int64_t> lastDisplayPeriodNs{ 0 };
+
 #if defined(SUPPORT_DX) && defined(SUPPORT_DX11)
 	// Synth swapchain per eye, allocated lazily on first
 	// CloseSynthCycleAndOpenEngineCycle call when synthDualCycle is enabled.
