@@ -41,13 +41,24 @@ public:
 	// is structurally working (magenta visible in HMD between engine frames =
 	// yes) vs. whether the texture copy path is broken (still black = no).
 	inline bool SynthDebugForceMagenta() const { return synthDebugForceMagenta; }
-	// Phase C2.8d: throttle engine to half display rate so synth content
-	// fills the in-between slots. When true, OpenSynthCycle sleeps at WGP
-	// entry until wall-clock has advanced >= 2 * runtime-reported display
-	// period since the previous WGP entry. Period is read from the most
-	// recent synth-wait's XrFrameState.predictedDisplayPeriod, so this
-	// auto-scales with display refresh rate (90Hz, 120Hz, 72Hz, etc.).
-	// Only meaningful when synthDualCycle=true.
+	// Phase C2.8d (SUPERSEDED by Phase C2.8e engine-side FPS cap):
+	//
+	// The original C2.8d / fix1 / fix2 throttled engine by holding OpenXR's
+	// xrWaitFrame past the next natural slot. This interacted unpredictably
+	// with Skyrim's main loop scheduling — fix2 testing showed multi-second
+	// gaps between engine frames despite a sane 22.222ms throttle target.
+	// Engine simply doesn't like having its OpenXR wait stalled from
+	// outside its own update loop.
+	//
+	// The replacement: CS-Fork now applies an FPS cap at the end of its
+	// IDXGISwapChain::Present hook (spin-sleep on QPC). Engine's frametime
+	// measurement, physics step, and frametime-dependent mods all see a
+	// consistent, well-formed half-rate frame.
+	//
+	// This setting is left defined (and the OpenSynthCycle code path
+	// preserved) so the throttle remains togglable for diagnostic A/B
+	// against the engine-side cap. Default false — turn it on ONLY for
+	// debugging; leave the engine-side cap doing the work.
 	inline bool SynthEngineThrottle() const { return synthEngineThrottle; }
 	inline bool EnableAudioSwitch() const { return enableAudioSwitch; }
 	std::string AudioDeviceName() const { return audioDeviceName; }
