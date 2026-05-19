@@ -27,6 +27,7 @@ using glm::vec4;
 #include "BaseClientCore.h"
 #include "Drivers/Backend.h"
 #include "Misc/ScopeGuard.h"
+#include "../../DrvOpenXR/XrBackend.h"
 
 using namespace vr;
 using namespace IVRCompositor_022;
@@ -439,7 +440,17 @@ bool BaseCompositor::ShouldAppRenderWithLowResources()
 
 void BaseCompositor::ForceInterleavedReprojectionOn(bool bOverride)
 {
-	// Force timewarp on? Yeah right.
+	// Phase C2.8f: route the OpenVR app's request through to our ASW
+	// implementation. Skyrim VR doesn't call this, but apps that do
+	// (or wrappers used for those apps) will now correctly engage 45fps
+	// interleaved reprojection mode.
+	auto* backend = dynamic_cast<XrBackend*>(BackendManager::Instance().GetBackendInstance());
+	if (backend) {
+		backend->SetAswRuntimeOverride(bOverride);
+		OOVR_LOGF("[SynthDC] ForceInterleavedReprojectionOn(%s) — ASW %s by runtime request",
+		    bOverride ? "true" : "false",
+		    bOverride ? "engaged" : "disengaged");
+	}
 }
 
 void BaseCompositor::ForceReconnectProcess()

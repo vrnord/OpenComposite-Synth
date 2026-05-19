@@ -41,25 +41,33 @@ public:
 	// is structurally working (magenta visible in HMD between engine frames =
 	// yes) vs. whether the texture copy path is broken (still black = no).
 	inline bool SynthDebugForceMagenta() const { return synthDebugForceMagenta; }
-	// Phase C2.8d (SUPERSEDED by Phase C2.8e engine-side FPS cap):
+	// Phase C2.8d/fix1/fix2 (SUPERSEDED by C2.8f):
 	//
-	// The original C2.8d / fix1 / fix2 throttled engine by holding OpenXR's
-	// xrWaitFrame past the next natural slot. This interacted unpredictably
-	// with Skyrim's main loop scheduling — fix2 testing showed multi-second
-	// gaps between engine frames despite a sane 22.222ms throttle target.
-	// Engine simply doesn't like having its OpenXR wait stalled from
-	// outside its own update loop.
-	//
-	// The replacement: CS-Fork now applies an FPS cap at the end of its
-	// IDXGISwapChain::Present hook (spin-sleep on QPC). Engine's frametime
-	// measurement, physics step, and frametime-dependent mods all see a
-	// consistent, well-formed half-rate frame.
-	//
-	// This setting is left defined (and the OpenSynthCycle code path
-	// preserved) so the throttle remains togglable for diagnostic A/B
-	// against the engine-side cap. Default false — turn it on ONLY for
-	// debugging; leave the engine-side cap doing the work.
+	// Old "hold xrWaitFrame past natural slot" throttle. Replaced by
+	// synthFrameInterpolation below, which emulates SteamVR ASW
+	// semantics cleanly. The OpenSynthCycle throttle code path is
+	// preserved for diagnostic A/B; default false.
 	inline bool SynthEngineThrottle() const { return synthEngineThrottle; }
+
+	// Phase C2.8f: ASW-style frame interpolation. Enabled with this
+	// toggle OR by an app calling IVRCompositor::ForceInterleavedReprojectionOn(true).
+	// When active:
+	//   - Engine sees the HMD reporting native_refresh / 2 Hz via
+	//     Prop_DisplayFrequency_Float (45Hz on a 90Hz headset).
+	//   - WGP blocks for 2 native display periods, not 1.
+	//   - The displayTime returned to engine for its render poses is
+	//     2 periods in the future, so engine extrapolates correctly.
+	//   - The runtime still scans out at native 90Hz; our synth cycle
+	//     fills the in-between slot via the existing dual-cycle plumbing
+	//     (synthDualCycle must also be true for synth content to display
+	//     instead of leaving the gap to SteamVR's own MVR reprojection).
+	//
+	// This is the "engine throttle" we actually want. The original C2.8d
+	// was on the right track but used the wrong period source (last
+	// observed, not native) and didn't update engine's predictedDisplayTime
+	// to match the longer interval. The result was Skyrim getting confused
+	// and producing 30Hz with multi-second gaps. This phase fixes both.
+	inline bool SynthFrameInterpolation() const { return synthFrameInterpolation; }
 	inline bool EnableAudioSwitch() const { return enableAudioSwitch; }
 	std::string AudioDeviceName() const { return audioDeviceName; }
 	inline bool EnableInputSmoothing() { return enableInputSmoothing; }
@@ -153,6 +161,8 @@ private:
 	bool synthDebugForceMagenta = false;
 	// Phase C2.8d engine throttle — see public getter for docs.
 	bool synthEngineThrottle = false;
+	// Phase C2.8f ASW-style frame interpolation — see public getter for docs.
+	bool synthFrameInterpolation = false;
 	bool enableAudioSwitch = false;
 	std::string audioDeviceName = "";
 	bool enableInputSmoothing = false;

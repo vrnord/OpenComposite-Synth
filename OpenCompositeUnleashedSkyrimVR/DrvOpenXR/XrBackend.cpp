@@ -620,6 +620,13 @@ void XrBackend::SynthSwapchain_Shutdown()
 #endif
 }
 
+// Phase C2.8f: ASW-style frame interpolation gate.
+bool XrBackend::IsAswActive() const
+{
+	if (!nativeDisplayPeriodCaptured.load()) return false;
+	return oovr_global_configuration.SynthFrameInterpolation() || aswRuntimeOverride.load();
+}
+
 void XrBackend::OpenSynthCycle()
 {
 	if (!sessionActive) return;
@@ -632,115 +639,93 @@ void XrBackend::OpenSynthCycle()
 		return;
 	}
 
-	// Phase C2.8d: engine throttle. Sleep until >= 2 * display period has
-	// elapsed since the last WGP entry. Requires at least one prior
-	// completed synth cycle (minDisplayPeriodNs < INT64_MAX). On first call
-	// after enable, lastEntry is 0 and minDisplayPeriodNs is INT64_MAX, so
-	// throttle is a no-op and these values get seeded at the bottom of
-	// this function.
+	// === Engine throttle (C2.8f primary path, C2.8d diagnostic fallback) ===
 	//
-	// Phase C2.8d-fix1: precision sleep via Win32 high-resolution waitable
-	// timer. std::this_thread::sleep_for's precision is bounded by Windows
-	// scheduler quantum (~15.6ms default, ~1ms with timeBeginPeriod(1)),
-	// which is fatal for 11ms targets (90Hz) and worse at higher refresh
-	// rates. CreateWaitableTimerExW with CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
-	// (Win10 1803+, universal in 2026) gives 100ns precision.
-	if (oovr_global_configuration.SynthEngineThrottle()) {
-		const int64_t lastEntry = tWGPLastEntryNs.load();
-		const int64_t period = minDisplayPeriodNs.load();
-		// period < INT64_MAX means we've observed at least one valid period.
-		if (lastEntry > 0 && period > 0 && period < INT64_MAX) {
-			using clock = std::chrono::steady_clock;
-			const int64_t targetNs = lastEntry + 2 * period;
-			const int64_t nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
-			    clock::now().time_since_epoch()).count();
-			if (nowNs < targetNs) {
-				int64_t sleepNs = targetNs - nowNs;
-
-				// Phase C2.8d-fix2: hard sanity ceiling. Caps engine at ~20Hz
-				// floor at any refresh rate. Prevents runaway throttle from
-				// any future pathology (memory corruption, multi-headset
-				// session switch, etc.) producing catastrophic slowdown.
-				// Normal operation should never reach this cap.
-				constexpr int64_t kMaxSleepNs = 50'000'000; // 50ms
-				if (sleepNs > kMaxSleepNs) {
-					static uint64_t s_capLogCount = 0;
-					if (s_capLogCount < 10) {
-						OOVR_LOGF("[SynthDC] WARNING: throttle sleep %.2fms exceeds "
-						    "%.0fms ceiling (min observed period %.3fms) — capping. "
-						    "If this fires often, min-observed-period tracking is broken.",
-						    sleepNs / 1e6, kMaxSleepNs / 1e6, period / 1e6);
-					}
-					s_capLogCount++;
-					sleepNs = kMaxSleepNs;
+	// The throttle target is "2 × NATIVE display period." For C2.8f we use
+	// nativeDisplayPeriodNs (captured one-shot, stable). For C2.8d we use
+	// minDisplayPeriodNs (mutable, can drift). The user picks via toggle.
+	{
+		const bool aswOn = IsAswActive();
+		const bool legacyThrottleOn = oovr_global_configuration.SynthEngineThrottle();
+		if (aswOn || legacyThrottleOn) {
+			const int64_t lastEntry = tWGPLastEntryNs.load();
+			int64_t period = 0;
+			const char* periodSource = nullptr;
+			if (aswOn) {
+				period = nativeDisplayPeriodNs.load();
+				periodSource = "C2.8f-native";
+			} else {
+				const int64_t minP = minDisplayPeriodNs.load();
+				if (minP > 0 && minP < INT64_MAX) {
+					period = minP;
+					periodSource = "C2.8d-min";
 				}
+			}
 
-				bool didHighResSleep = false;
+			if (lastEntry > 0 && period > 0) {
+				using clock = std::chrono::steady_clock;
+				const int64_t targetNs = lastEntry + 2 * period;
+				const int64_t nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+				    clock::now().time_since_epoch()).count();
+				if (nowNs < targetNs) {
+					int64_t sleepNs = targetNs - nowNs;
 
+					// Hard sanity cap (~20Hz floor at any refresh rate).
+					constexpr int64_t kMaxSleepNs = 50'000'000;
+					if (sleepNs > kMaxSleepNs) {
+						static uint64_t s_capLogCount = 0;
+						if (s_capLogCount < 10) {
+							OOVR_LOGF("[SynthDC] WARNING: throttle sleep %.2fms "
+							    "exceeds %.0fms ceiling (period %.3fms src=%s) — capping",
+							    sleepNs / 1e6, kMaxSleepNs / 1e6,
+							    period / 1e6, periodSource);
+						}
+						s_capLogCount++;
+						sleepNs = kMaxSleepNs;
+					}
+
+					bool didHighResSleep = false;
 #ifdef _WIN32
-				// Lazily create the waitable timer on first use.
-				if (!hHighResTimer && !throttleHighResTimerFailed) {
-					hHighResTimer = CreateWaitableTimerExW(
-					    nullptr,
-					    nullptr,
-					    CREATE_WAITABLE_TIMER_HIGH_RESOLUTION | CREATE_WAITABLE_TIMER_MANUAL_RESET,
-					    TIMER_ALL_ACCESS);
-					if (!hHighResTimer) {
-						const DWORD err = GetLastError();
-						OOVR_LOGF("[SynthDC] WARNING: CreateWaitableTimerExW(HIGH_RESOLUTION) "
-						    "failed (err=%lu) — falling back to std::this_thread::sleep_for "
-						    "for engine throttle; pacing precision will be ~15ms instead of "
-						    "<1ms. This is unexpected on Win10 1803+ and may cause visible "
-						    "frame-pacing jitter.", (unsigned long)err);
-						throttleHighResTimerFailed = true;
-					}
-				}
-
-				if (hHighResTimer) {
-					// SetWaitableTimer takes a LARGE_INTEGER due time in 100ns units.
-					// Negative = relative to now. So sleepNs / 100 negated.
-					LARGE_INTEGER due;
-					due.QuadPart = -(LONGLONG)(sleepNs / 100);
-					if (SetWaitableTimer(hHighResTimer, &due, 0, nullptr, nullptr, FALSE)) {
-						// Timeout cap: ceil(sleepNs/1e6) + 10ms safety margin.
-						// Hitting this means something went wrong; better to
-						// return than block indefinitely.
-						const DWORD timeoutMs = (DWORD)((sleepNs + 999999) / 1000000) + 10;
-						const DWORD waitResult = WaitForSingleObject(hHighResTimer, timeoutMs);
-						if (waitResult == WAIT_OBJECT_0) {
-							didHighResSleep = true;
-						} else {
-							static uint64_t s_waitFailLogCount = 0;
-							if (s_waitFailLogCount < 5) {
-								OOVR_LOGF("[SynthDC] WARNING: WaitForSingleObject on high-res "
-								    "timer returned 0x%08x (expected 0 = WAIT_OBJECT_0); "
-								    "throttle precision may be degraded",
-								    (unsigned)waitResult);
-							}
-							s_waitFailLogCount++;
+					if (!hHighResTimer && !throttleHighResTimerFailed) {
+						hHighResTimer = CreateWaitableTimerExW(
+						    nullptr, nullptr,
+						    CREATE_WAITABLE_TIMER_HIGH_RESOLUTION | CREATE_WAITABLE_TIMER_MANUAL_RESET,
+						    TIMER_ALL_ACCESS);
+						if (!hHighResTimer) {
+							const DWORD err = GetLastError();
+							OOVR_LOGF("[SynthDC] WARNING: CreateWaitableTimerExW failed "
+							    "err=%lu — falling back to sleep_for; pacing may jitter",
+							    (unsigned long)err);
+							throttleHighResTimerFailed = true;
 						}
 					}
-				}
+					if (hHighResTimer) {
+						LARGE_INTEGER due;
+						due.QuadPart = -(LONGLONG)(sleepNs / 100);
+						if (SetWaitableTimer(hHighResTimer, &due, 0, nullptr, nullptr, FALSE)) {
+							DWORD timeoutMs = (DWORD)((sleepNs + 999999) / 1000000) + 10;
+							if (WaitForSingleObject(hHighResTimer, timeoutMs) == WAIT_OBJECT_0) {
+								didHighResSleep = true;
+							}
+						}
+					}
 #endif
+					if (!didHighResSleep) {
+						std::this_thread::sleep_for(std::chrono::nanoseconds(sleepNs));
+					}
 
-				if (!didHighResSleep) {
-					// Fallback path: best-effort std::this_thread::sleep_for.
-					std::this_thread::sleep_for(std::chrono::nanoseconds(sleepNs));
+					static uint64_t s_throttleLogCount = 0;
+					if (s_throttleLogCount < 5 || (s_throttleLogCount % 600) == 0) {
+						const int64_t postNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+						    clock::now().time_since_epoch()).count();
+						const int64_t actualSleepNs = postNs - nowNs;
+						OOVR_LOGF("[SynthDC] throttle: requested %.3fms slept %.3fms "
+						    "(target=2x%.3fms period src=%s)",
+						    sleepNs / 1e6, actualSleepNs / 1e6,
+						    period / 1e6, periodSource);
+					}
+					s_throttleLogCount++;
 				}
-
-				static uint64_t s_throttleLogCount = 0;
-				if (s_throttleLogCount < 5 || (s_throttleLogCount % 600) == 0) {
-					// Measure the ACTUAL slept duration so we can detect timer
-					// precision issues in the field.
-					const int64_t postNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
-					    clock::now().time_since_epoch()).count();
-					const int64_t actualSleepNs = postNs - nowNs;
-					OOVR_LOGF("[SynthDC] throttle: requested %.3fms slept %.3fms "
-					    "(target=2x%.3fms MIN-observed period, mechanism=%s)",
-					    sleepNs / 1e6, actualSleepNs / 1e6, period / 1e6,
-					    didHighResSleep ? "high-res-timer" : "sleep_for");
-				}
-				s_throttleLogCount++;
 			}
 		}
 	}
@@ -758,15 +743,38 @@ void XrBackend::OpenSynthCycle()
 		return;
 	}
 
-	// Synth's wait fills xr_gbl->nextPredictedFrameTime; engine's later wait
-	// will overwrite this with engine's slot time.
-	xr_gbl->nextPredictedFrameTime = state.predictedDisplayTime;
+	// Phase C2.8f: one-shot native period capture. The very first
+	// xrWaitFrame returns a clean native-period value before any ASW
+	// dynamics could have engaged. Lock it in.
+	if (!nativeDisplayPeriodCaptured.load() && state.predictedDisplayPeriod > 0) {
+		nativeDisplayPeriodNs.store((int64_t)state.predictedDisplayPeriod);
+		nativeDisplayPeriodCaptured.store(true);
+		OOVR_LOGF("[SynthDC] native display period captured: %lld ns (~%.3f Hz)",
+		    (long long)state.predictedDisplayPeriod,
+		    1e9 / (double)state.predictedDisplayPeriod);
+	}
 
-	// Locate views for synth's slot. (Spike: engine reuses these poses for
-	// its render; refinement would locate twice — once per slot.)
+	// Phase C2.8f: when ASW is active, engine should extrapolate poses
+	// to its actual display slot, which is 2 native periods in the future
+	// (not 1). Synth still uses the 1-period predictedDisplayTime for its
+	// own slot.
+	XrTime synthSlotTime = state.predictedDisplayTime;
+	XrTime engineSlotTime = state.predictedDisplayTime;
+	if (IsAswActive()) {
+		// Engine's slot = synth's slot + 1 native period.
+		engineSlotTime = state.predictedDisplayTime + (XrTime)nativeDisplayPeriodNs.load();
+	}
+
+	// xr_gbl->nextPredictedFrameTime is what BaseSystem and pose
+	// extrapolation read. In ASW mode this should reflect engine's slot,
+	// not synth's, since engine is the one rendering for it.
+	xr_gbl->nextPredictedFrameTime = engineSlotTime;
+
+	// Locate views for synth's slot. The projection views populated here
+	// will be re-located for engine's slot in CloseSynthCycleAndOpenEngineCycle.
 	XrViewLocateInfo locateInfo = { XR_TYPE_VIEW_LOCATE_INFO };
 	locateInfo.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
-	locateInfo.displayTime = state.predictedDisplayTime;
+	locateInfo.displayTime = synthSlotTime;
 	locateInfo.space = xr_space_from_ref_space_type(GetUnsafeBaseSystem()->currentSpace);
 	XrViewState viewState = { XR_TYPE_VIEW_STATE };
 	uint32_t viewCount = 0;
@@ -794,27 +802,22 @@ void XrBackend::OpenSynthCycle()
 
 	synthCyclePending.store(true);
 
-	// Phase C2.8d-fix2: record this WGP's wall-clock entry and update
-	// the minimum observed predictedDisplayPeriod. Min, not most-recent,
-	// to defeat the SteamVR-inflated-period feedback loop. The runtime
-	// cannot physically report a period shorter than the headset's true
-	// native vsync interval, so min converges to that ground truth.
-	if (oovr_global_configuration.SynthEngineThrottle()) {
+	// Record wall-clock entry for the next call's throttle math.
+	// Done unconditionally when EITHER throttle path is in use so toggling
+	// at runtime doesn't leave a stale anchor.
+	if (IsAswActive() || oovr_global_configuration.SynthEngineThrottle()) {
 		using clock = std::chrono::steady_clock;
 		const int64_t nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
 		    clock::now().time_since_epoch()).count();
 		tWGPLastEntryNs.store(nowNs);
 
+		// Keep the legacy minDisplayPeriodNs CAS-min updated even when ASW
+		// is the active path — costs nothing and useful diagnostic.
 		const int64_t newPeriod = (int64_t)state.predictedDisplayPeriod;
 		if (newPeriod > 0) {
-			// CAS-loop to atomically update min. Contended only during the
-			// rare case of period changing — single-writer in practice
-			// (this function called only from engine's WGP thread).
 			int64_t current = minDisplayPeriodNs.load();
 			while (newPeriod < current
 			       && !minDisplayPeriodNs.compare_exchange_weak(current, newPeriod)) {
-				// current was reloaded by compare_exchange_weak; loop until
-				// we win the CAS or someone else lowered min below newPeriod.
 			}
 		}
 	}
@@ -975,12 +978,19 @@ void XrBackend::CloseSynthCycleAndOpenEngineCycle(
 		return;
 	}
 
-	xr_gbl->nextPredictedFrameTime = eState.predictedDisplayTime;
-	engineCyclePredictedTime.store((int64_t)eState.predictedDisplayTime);
+	// Phase C2.8f: in ASW mode, engine's slot is 1 native period AFTER
+	// the runtime's "next slot" (which is synth's slot we just submitted).
+	XrTime engineLocateTime = eState.predictedDisplayTime;
+	if (IsAswActive()) {
+		engineLocateTime = eState.predictedDisplayTime + (XrTime)nativeDisplayPeriodNs.load();
+	}
+
+	xr_gbl->nextPredictedFrameTime = engineLocateTime;
+	engineCyclePredictedTime.store((int64_t)engineLocateTime);
 
 	XrViewLocateInfo eLocateInfo = { XR_TYPE_VIEW_LOCATE_INFO };
 	eLocateInfo.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
-	eLocateInfo.displayTime = eState.predictedDisplayTime;
+	eLocateInfo.displayTime = engineLocateTime;
 	eLocateInfo.space = xr_space_from_ref_space_type(GetUnsafeBaseSystem()->currentSpace);
 	XrViewState eViewState = { XR_TYPE_VIEW_STATE };
 	uint32_t eViewCount = 0;
@@ -1044,12 +1054,19 @@ void XrBackend::CloseSynthCycleAsPlaceholderAndOpenEngineCycle()
 	XrFrameWaitInfo eWaitInfo{ XR_TYPE_FRAME_WAIT_INFO };
 	XrFrameState eState{ XR_TYPE_FRAME_STATE };
 	OOVR_FAILED_XR_ABORT(xrWaitFrame(session, &eWaitInfo, &eState));
-	xr_gbl->nextPredictedFrameTime = eState.predictedDisplayTime;
-	engineCyclePredictedTime.store((int64_t)eState.predictedDisplayTime);
+
+	// Phase C2.8f: in ASW mode, engine's slot is 1 native period AFTER
+	// the runtime's "next slot." Match the main CloseSynth path's offset.
+	XrTime engineLocateTime = eState.predictedDisplayTime;
+	if (IsAswActive()) {
+		engineLocateTime = eState.predictedDisplayTime + (XrTime)nativeDisplayPeriodNs.load();
+	}
+	xr_gbl->nextPredictedFrameTime = engineLocateTime;
+	engineCyclePredictedTime.store((int64_t)engineLocateTime);
 
 	XrViewLocateInfo eLocateInfo = { XR_TYPE_VIEW_LOCATE_INFO };
 	eLocateInfo.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
-	eLocateInfo.displayTime = eState.predictedDisplayTime;
+	eLocateInfo.displayTime = engineLocateTime;
 	eLocateInfo.space = xr_space_from_ref_space_type(GetUnsafeBaseSystem()->currentSpace);
 	XrViewState eViewState = { XR_TYPE_VIEW_STATE };
 	uint32_t eViewCount = 0;

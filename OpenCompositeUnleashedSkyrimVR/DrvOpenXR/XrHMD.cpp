@@ -8,6 +8,8 @@
 #include "../OpenOVR/Misc/xrmoreutils.h"
 #include "../OpenOVR/Reimpl/BaseSystem.h"
 #include "../OpenOVR/convert.h"
+#include "../OpenOVR/Drivers/Backend.h"
+#include "XrBackend.h"
 #include "generated/static_bases.gen.h"
 #include <chrono>
 #include <thread>
@@ -372,8 +374,26 @@ float XrHMD::GetFloatTrackedDeviceProperty(vr::ETrackedDeviceProperty prop, vr::
 	TRY_PROFILE_PROP(float);
 
 	switch (prop) {
-	case vr::Prop_DisplayFrequency_Float:
-		return 90.0; // TODO use the real value
+	case vr::Prop_DisplayFrequency_Float: {
+		// Native default. TODO: query xrEnumerateDisplayRefreshRatesFB
+		// or equivalent for the real value; for now 90Hz matches the
+		// dominant SteamVR-OpenXR setup.
+		float native = 90.0f;
+		// Phase C2.8f: if ASW is active, report HALF the native rate so
+		// engine paces itself accordingly. Engine's WGP-to-WGP wall-clock
+		// also halves (we hold WGP for 2 native periods), and engine's
+		// predictedDisplayTime is set to engine's actual slot. Consistent
+		// 45Hz HMD from engine's perspective.
+		auto* backend = dynamic_cast<XrBackend*>(BackendManager::Instance().GetBackendInstance());
+		if (backend && backend->IsAswActive()) {
+			const int64_t nativePeriodNs = backend->NativeDisplayPeriodNs();
+			if (nativePeriodNs > 0) {
+				native = 1e9f / (float)nativePeriodNs;
+			}
+			return native / 2.0f;
+		}
+		return native;
+	}
 	case vr::Prop_LensCenterLeftU_Float:
 	case vr::Prop_LensCenterLeftV_Float:
 	case vr::Prop_LensCenterRightU_Float:

@@ -105,20 +105,35 @@ public:
 	// displayTime instead of xr_gbl->nextPredictedFrameTime.
 	std::atomic<int64_t> engineCyclePredictedTime{ 0 };
 
-	// Phase C2.8d: throttle state. tWGPLastEntryNs is wall-clock (nanoseconds
-	// since steady_clock epoch) of the most recent OpenSynthCycle entry,
-	// AFTER any sleep. Updated only when synthEngineThrottle is enabled.
-	//
-	// Phase C2.8d-fix2: track the MINIMUM observed predictedDisplayPeriod
-	// from xrWaitFrame, not the most recent value. The runtime inflates the
-	// reported period when an app misses slots (SteamVR adaptive frame
-	// timing), so using "last observed" caused a runaway feedback loop where
-	// our throttle made pacing worse, runtime inflated period further, we
-	// throttled longer, and so on. The minimum cannot exceed the headset's
-	// true native vsync interval, so it converges to the right target.
-	// Initialized to INT64_MAX so the first observed period always wins min().
+	// Phase C2.8d/fix2 throttle state (preserved for diagnostic A/B).
+	// minDisplayPeriodNs is the rolling minimum predictedDisplayPeriod
+	// from xrWaitFrame. Used ONLY when synthEngineThrottle=true (the
+	// superseded diagnostic toggle).
 	std::atomic<int64_t> tWGPLastEntryNs{ 0 };
 	std::atomic<int64_t> minDisplayPeriodNs{ INT64_MAX };
+
+	// Phase C2.8f: ASW-style frame interpolation state.
+	//
+	// nativeDisplayPeriodNs is the headset's true native vsync interval,
+	// captured ONCE from the first xrWaitFrame's predictedDisplayPeriod
+	// at session start, then locked. Unlike minDisplayPeriodNs which can
+	// shift if the runtime ever reports a shorter period, this is a fixed
+	// value captured before any ASW dynamics can confuse it.
+	//
+	// nativeDisplayPeriodCaptured guards the one-shot capture.
+	//
+	// aswRuntimeOverride is set by IVRCompositor::ForceInterleavedReprojectionOn.
+	// Either it OR Config::SynthFrameInterpolation() being true engages
+	// the ASW path. Lets engines that voluntarily ask for ASW get it.
+	std::atomic<int64_t> nativeDisplayPeriodNs{ 0 };
+	std::atomic<bool>    nativeDisplayPeriodCaptured{ false };
+	std::atomic<bool>    aswRuntimeOverride{ false };
+
+	// Helper: ASW is active if config toggle OR runtime override is on,
+	// AND we have a captured native period to base timing on.
+	bool IsAswActive() const;
+	int64_t NativeDisplayPeriodNs() const { return nativeDisplayPeriodNs.load(); }
+	void SetAswRuntimeOverride(bool on) { aswRuntimeOverride.store(on); }
 
 	// Phase C2.8d-fix1: high-resolution waitable timer for engine throttle.
 	// Lazily created on first throttle invocation, reused thereafter, closed
